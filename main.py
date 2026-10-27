@@ -7,6 +7,7 @@ from fastapi import FastAPI, Body, HTTPException
 from core import replyMsg, isNeedResume, isNeedWorks, evaluateSingleRouteDelivery
 from schema import Msg
 from config import Config
+import llm_judge
 
 
 app = FastAPI()
@@ -22,6 +23,14 @@ def append_job_decision_log(result: dict, raw_job: str, delay_ms: int):
         'matchedField': result.get('matched_field'),
         'keyword': result.get('keyword'),
         'score': result.get('score'),
+        'ruleScore': result.get('rule_score'),
+        'llmApply': result.get('llm_apply'),
+        'llmRole': result.get('llm_role'),
+        'llmLanguage': result.get('llm_language'),
+        'llmReason': result.get('llm_reason'),
+        'llmModel': result.get('llm_model'),
+        'llmCached': result.get('llm_cached'),
+        'llmLatencyMs': result.get('llm_latency_ms'),
         'introduce': result.get('introduce'),
         'resumeIndex': result.get('resumeIndex'),
         'titleScore': result.get('title_score'),
@@ -68,6 +77,16 @@ async def get_client_config():
 @app.post("/get-job-score", summary="获取职位匹配度")
 async def get_job_score(job: str = Body(..., description="职位信息")):
     result = evaluateSingleRouteDelivery(job)
+    thread = int(Config.frontend.get('thread') or 0)
+
+    # 规则先过一遍，再让大模型复核（默认关闭，见 user_config.json 的 llm 段）
+    verdict = None
+    if llm_judge.should_call(result['score'], thread):
+        verdict = await asyncio.to_thread(
+            llm_judge.judge, result.get('title') or '', result.get('detail') or '', result['score']
+        )
+        result = llm_judge.apply_verdict(result, verdict, thread)
+
     delay_ms = max(0, Config.job_score_delay_base_ms + random.randint(
         -Config.job_score_delay_jitter_ms,
         Config.job_score_delay_jitter_ms,
@@ -80,7 +99,20 @@ async def get_job_score(job: str = Body(..., description="职位信息")):
         'detail': '职位描述',
         'none': '未命中',
         'title_negative': '标题负向拦截',
+        'title_nondev': '职能不符',
     }
+    llm_part = ''
+    if verdict is not None:
+        cache_flag = ',cache' if verdict.get('cached') else ''
+        llm_part = (
+            f" | llm={'apply' if verdict.get('apply') else 'skip'}"
+            f"/{verdict.get('role_type')}/{verdict.get('language')}"
+            f"({verdict.get('latency_ms')}ms{cache_flag})"
+            f"/{verdict.get('reason')}"
+        )
+    rule_part = ''
+    if result.get('rule_score') is not None:
+        rule_part = f"(规则{result['rule_score']})"
     print(
         f"[{time_str}] /get-job-score | "
         f"title={title} | "
@@ -92,8 +124,9 @@ async def get_job_score(job: str = Body(..., description="职位信息")):
         f"title_penalty_score={result.get('title_penalty_score', 0)} | "
         f"penalty_score={result['penalty_score']} | "
         f"delay_ms={delay_ms} | "
-        f"score={result['score']} | "
-        f"reason={result['reason']}",
+        f"score={result['score']}{rule_part} | "
+        f"reason={result['reason']}"
+        f"{llm_part}",
         flush=True
     )
     append_job_decision_log(result, job, delay_ms)
@@ -109,6 +142,44 @@ async def get_job_score(job: str = Body(..., description="职位信息")):
 async def log_action(action: dict = Body(..., description="动作日志")):
     append_job_action_log(action)
     return {'success': True}
+
+
+@app.get("/greet-stats", summary="今日打招呼统计（用于校准前端日限计数）")
+async def greet_stats():
+    today = datetime.now().strftime('%Y-%m-%d')
+    greeted = 0
+    failed = 0
+    if ACTION_LOG_PATH.exists():
+        with ACTION_LOG_PATH.open('r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not str(record.get('loggedAt', '')).startswith(today):
+                    continue
+                action = record.get('action')
+                if action == 'chat_open_requested':
+                    greeted += 1
+                elif action == 'greet_queue_failed':
+                    failed += 1
+    return {'date': today, 'greeted': greeted, 'failed': failed}
+
+
+@app.get("/llm-status", summary="查看大模型复核状态")
+async def llm_status():
+    return {
+        'enabled': llm_judge.is_enabled(),
+        'describe': llm_judge.describe(),
+        'mode': Config.llm.get('mode'),
+        'model': Config.llm.get('model'),
+        'baseUrl': Config.llm.get('base_url'),
+        'calls': llm_judge._call_count,
+        'cacheSize': len(llm_judge._cache),
+    }
 
 
 @app.post("/reply", summary="回复消息")

@@ -6,6 +6,7 @@
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
 // @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
 // ==/UserScript==
 
 (function () {
@@ -13,22 +14,48 @@
 
     // 配置项
     const OPTIONS = {
-        resumeIndex: 0, // 第几份简历，从 0 开始递增
+        resumeIndex: 0, // 兜底用的简历序号，从 0 开始；正常情况下按 resume.match 选简历
         serverHost: 'http://127.0.0.1:8000', // 本地服务的主机地址
         thread: 50, // 分数阈值，低于这个就不发消息了
-        timestampTimeout: 3000, // 时间戳过期时间，单位毫秒，根据当前网络设定，建议不要太大。
+        // 注意：timestampTimeout 必须大于 detailTimeout。
+        // 详情页只有在“时间窗”内才会把岗位信息回传给搜索页，
+        // 一旦时间窗比 detailTimeout 短，搜索页就永远等不到回传，只能超时跳过。
+        timestampTimeout: 45000, // 跨页时间窗，单位毫秒
         onlyGreet: false, // 是否只打招呼，默认为false，即打招呼和代聊天
         manualFilterWaitMs: 10000, // 每轮搜索后留给用户手动筛选的时间
         roundRestartDelayMs: 2000, // 本轮结束后，启动下一轮前的缓冲时间
-        maxEmptyRounds: 3, // 连续多少轮没有拿到新岗位后停止，避免空转
-        detailTimeout: 10000, // 获取职位详情超时时间
-        greetTimeout: 12000, // 打招呼页回执超时时间
+        maxEmptyRounds: 3, // 连续多少轮没有拿到新岗位后切换关键词（不是停止）
+        // 安全阀：Boss 平台按天限制沟通数（约 150/天），这里留余量。0 表示不限制
+        maxGreetsPerDay: 120, // 当天累计最多打招呼多少个（跨重启有效，存 localStorage）
+        maxGreetsPerRun: 0, // 本次运行最多打招呼多少个（0=不限，日常靠日限兜底）
+        maxRunHours: 6, // 本次运行最多跑多少小时
+        maxRounds: 0, // 最多跑多少轮（0=不限）
+        detailTimeout: 15000, // 单次获取职位详情的等待上限
+        detailRetry: 1, // 详情超时后的重试次数（只对“超时”重试，明确失败不重试）
+        detailReadyTimeout: 6000, // 详情页等待关键 DOM 就绪的上限，超时立刻回报错误，不再干等
+        detailOpenWaitMs: 400, // 打开详情标签后先等多久再开始收消息
+        greetTimeout: 25000, // 打招呼页回执超时：要大于“页面加载 + 找输入框(8s) + 发送(5s)”的最坏耗时
         preloadScrollPixels: 180, // 岗位预加载：每轮下滑像素
         preloadScrollWaitMs: 450, // 岗位预加载：每轮等待毫秒数
         preloadStableRoundsLimit: 24, // 岗位预加载：连续多少轮无增长后结束
         preloadMaxRounds: 300, // 岗位预加载：最多滑动多少轮
+        preloadMaxJobs: 0, // 岗位预加载：岗位数上限，0 表示不限；建议 80~120，岗位太多会拖慢详情页
         preloadActivateCardEvery: 0, // 预加载时每隔多少轮尝试轻点一次左侧岗位卡片，0 表示关闭
         preloadActivateCardWaitMs: 250, // 轻点岗位卡片后的额外等待时间
+        // Boss 回复后自动发简历：和 onlyGreet 无关，独立开关
+        autoSendResumeOnReply: true,
+        chatPollIntervalMs: 180000, // 处理岗位期间，每隔多久去聊天页看一次新回复
+        chatPollTimeout: 60000, // 单次检查最多等多久，超时就继续投岗位
+        // 指定简历：优先按 resume.match 里的关键字匹配，匹配不到就不发（strict）
+        resume: {
+            name: '', // 想发的那份简历的名字/文件名关键字，排在最前面匹配
+            match: [], // 关键字列表，按顺序匹配
+            exclude: ['在线简历', '模板简历'], // 明确不发的简历
+            preferAttachment: true, // 优先切到“附件简历”页签
+            strict: true, // true：匹配不到就放弃发送；false：允许发出默认选中的简历
+            followUpText: '已发送，请查收', // 发完简历后补一句话，置空则不补
+        },
+        resumeMatch: '', // 旧字段，逗号分隔的关键字，仍兼容
     };
 
     // 元素选择器
@@ -91,12 +118,16 @@
         },
     };
 
+    // 标记这次打开聊天页是“途中轮询新回复”还是“轮次结束处理”
+    const CHAT_MODE_KEY = '__zhipin_chat_mode';
+    const CHAT_MODE_POLL = 'poll';
+
     // 工具
     const tools = {
         inWhiteList: function (pathObj) {
             return Object.values(pathObj).some((path) => location.pathname.startsWith(path));
         },
-        endlessFind: function (selector) {
+        endlessFind: function (selector, timeout = 10000) {
             return new Promise((resolve, reject) => {
                 // 初始立即检查元素是否存在
                 let element;
@@ -115,7 +146,7 @@
                 const timeoutId = setTimeout(() => {
                     observer.disconnect();
                     reject(new Error('未找到目标元素'));
-                }, 10000);
+                }, timeout);
 
                 // 定义MutationObserver回调
                 const observer = new MutationObserver((_, obs) => {
@@ -171,7 +202,8 @@
         },
         openTabNSetTimestamp(href, key, self = false) {
             localStorage.setItem(key, new Date().getTime());
-            window.open(href, self ? '_self' : key);
+            const ref = window.open(href, self ? '_self' : key);
+            return ref;
         },
     };
 
@@ -217,6 +249,35 @@
     }
 
 
+    // 应用后端下发的前端配置（resume 需要二级合并，避免覆盖默认值）
+    // 搜索页和聊天页都要用：聊天页也必须知道 resume.match 才能发简历
+    function applyFrontendOptions(frontend, log) {
+        const say = typeof log === 'function' ? log : function () { };
+        if (!frontend || typeof frontend !== 'object') return;
+        const nextResume = Object.assign({}, OPTIONS.resume || {});
+        for (const key of Object.keys(frontend)) {
+            const value = frontend[key];
+            if (value === undefined || value === null) continue;
+            if (key === 'resume' && typeof value === 'object') {
+                Object.assign(nextResume, value);
+            } else {
+                OPTIONS[key] = value;
+            }
+        }
+        OPTIONS.resume = nextResume;
+
+        // 自检：详情页只在时间窗内回传，时间窗必须比详情等待长
+        const detailTimeout = Number(OPTIONS.detailTimeout) || 0;
+        const timestampTimeout = Number(OPTIONS.timestampTimeout) || 0;
+        if (detailTimeout && timestampTimeout <= detailTimeout) {
+            OPTIONS.timestampTimeout = detailTimeout + 15000;
+            say(`配置自检：timestampTimeout(${timestampTimeout}) 应大于 detailTimeout(${detailTimeout})，` +
+                `本次自动调整为 ${OPTIONS.timestampTimeout}，请同步修改 user_config.json`);
+        }
+        const resumeKeywords = (OPTIONS.resume.match || []).join(' / ') || (OPTIONS.resume.name || '未配置');
+        say(`简历策略：指定关键字 [${resumeKeywords}]，严格模式 ${OPTIONS.resume.strict !== false ? '开' : '关'}`);
+    }
+
     class WebBroadcastError extends Error {
         constructor(code, message) {
             super(message);
@@ -243,6 +304,8 @@
             this.evts = {};
             this.pendingResponses = {};
             this.pendingReceives = {};
+            // 暂时没人等、但已经到达的消息先放这里，避免两次 receive 之间漏消息
+            this.inbox = {};
 
             // 初始化通信通道
             this.initChannel();
@@ -297,6 +360,9 @@
                 pending.resolve(resp.data);
                 clearTimeout(pending.timer);
                 delete this.pendingReceives[receiveKey];
+            } else if (!this.pendingResponses[resp.data?.requestId]) {
+                // 没人在等，先缓存起来，等下一次 receive 时优先取用
+                this.pushInbox(receiveKey, resp.data);
             }
 
             // 处理 sendAndReceive 响应
@@ -306,6 +372,29 @@
                 clearTimeout(pending.timer);
                 delete this.pendingResponses[resp.data.requestId];
             }
+        }
+
+        /* -------------------- 消息缓存 -------------------- */
+        pushInbox(key, data) {
+            if (!data || typeof data !== 'object' || data.requestId) return;
+            const list = this.inbox[key] || (this.inbox[key] = []);
+            list.push({ data, ts: Date.now() });
+            if (list.length > 20) list.shift();
+        }
+
+        takeInbox(key, maxAge = 120000) {
+            const list = this.inbox[key];
+            if (!list || !list.length) return null;
+            const now = Date.now();
+            while (list.length) {
+                const item = list.shift();
+                if (now - item.ts <= maxAge) return item.data;
+            }
+            return null;
+        }
+
+        clearInbox(from, type) {
+            delete this.inbox[`${from}-${type}`];
         }
 
         /* -------------------- 消息收发方法 -------------------- */
@@ -335,6 +424,9 @@
 
         receive(from, type, timeout = 30000) {
             const key = `${from}-${type}`;
+            // 已经到达过的消息优先返回，避免漏收
+            const cached = this.takeInbox(key);
+            if (cached) return Promise.resolve(cached);
             return new Promise((resolve, reject) => {
                 const timer = setTimeout(() => {
                     reject(new WebBroadcastError('TIMEOUT', `接收超时: ${type}`));
@@ -399,6 +491,7 @@
             window.removeEventListener('storage', this.handleMessage);
             this.pendingResponses = {};
             this.pendingReceives = {};
+            this.inbox = {};
         }
     }
 
@@ -512,6 +605,13 @@
                     resolve(res.need);
                 }).catch(reject);
             });
+        }
+
+        /**
+         * 今日打招呼统计（后端按 job_actions.jsonl 统计）
+         */
+        getGreetStats() {
+            return new Promise((resolve, reject) => this.__http('/greet-stats').then(resolve).catch(reject));
         }
 
         /**
@@ -685,6 +785,30 @@
             // 记录开始时间
             const start = new Date().getTime();
             let count = 0;
+            let greetCount = 0; // 本次已打招呼数量
+            let runStartedAt = start; // 本次运行起点（手动继续后会重置）
+            // 当天计数：Boss 是“按天”限流的，重启脚本不能重置这个数
+            const DAILY_GREET_KEY = '__zhipin_daily_greet';
+            const todayStr = () => {
+                const d = new Date();
+                return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            };
+            const readDailyCount = () => {
+                try {
+                    const rec = JSON.parse(localStorage.getItem(DAILY_GREET_KEY) || '{}');
+                    return rec && rec.date === todayStr() ? Number(rec.count) || 0 : 0;
+                } catch (e) {
+                    return 0;
+                }
+            };
+            const bumpDailyCount = () => {
+                const next = readDailyCount() + 1;
+                try {
+                    localStorage.setItem(DAILY_GREET_KEY, JSON.stringify({ date: todayStr(), count: next }));
+                } catch (e) { /* 忽略 */ }
+                return next;
+            };
+            let dailyGreetCount = readDailyCount();
             let page = 0;
             // 记录职位链接
             let jobHrefs = [];
@@ -699,10 +823,45 @@
             let currentKeyword = '';
             let currentTagIdx = -1;
             const processedJobHrefs = new Set();
+            // 从链接里取岗位 id
+            const jobIdOf = (href) => {
+                const m = String(href || '').match(/job_detail\/([^/.?]+)/);
+                return m ? m[1] : String(href || '');
+            };
+            // 已处理岗位持久化（7 天）：刷新/重启后不再重复投同一个岗位，避免浪费日限
+            const PROCESSED_KEY = '__zhipin_processed_jobs';
+            const loadProcessedStore = () => {
+                try {
+                    const raw = JSON.parse(localStorage.getItem(PROCESSED_KEY) || '{}') || {};
+                    const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+                    const fresh = {};
+                    Object.keys(raw).forEach((k) => {
+                        if (Number(raw[k]) > cutoff) fresh[k] = raw[k];
+                    });
+                    return fresh;
+                } catch (e) {
+                    return {};
+                }
+            };
+            const processedStore = loadProcessedStore();
+            Object.keys(processedStore).forEach((k) => processedJobHrefs.add(k));
+            const rememberProcessed = (href) => {
+                processedJobHrefs.add(href);
+                processedJobHrefs.add(jobIdOf(href));
+                processedStore[jobIdOf(href)] = Date.now();
+                try {
+                    localStorage.setItem(PROCESSED_KEY, JSON.stringify(processedStore));
+                } catch (e) { /* 忽略存储失败 */ }
+            };
+            let lastChatPollAt = 0;
+            let chatPolling = false;
 
             // 日志启动暂停事件
             const logger = new Logger(() => {
                 this.pause = false;
+                // 手动点“继续”后重新计时、重新计本次数；当日累计不清零（Boss 按天限流）
+                greetCount = 0;
+                runStartedAt = Date.now();
                 if (!started) return main();
                 if (pendingRoundRestart) {
                     pendingRoundRestart = false;
@@ -712,6 +871,39 @@
             }, () => {
                 this.pause = true;
             });
+
+            // 统一的“停止”出口：把状态置为暂停，并让用户知道为什么停
+            const stopProgram = (reason) => {
+                this.pause = true;
+                logger.divider();
+                logger.add(`⏹ 程序已停止：${reason}`);
+                logger.add('需要继续就点面板上的「继续」（会重置计数和计时）');
+                if (logger.runBtn) logger.runBtn.innerText = '继续';
+                logAction({ action: 'program_stopped', scene: 'search', reason });
+            };
+
+            // 三个安全阀：打招呼数 / 运行时长 / 轮数
+            const hitLimit = () => {
+                const hours = (Date.now() - runStartedAt) / 3600000;
+                const dailyLimit = Number(OPTIONS.maxGreetsPerDay);
+                if (dailyLimit > 0 && dailyGreetCount >= dailyLimit) {
+                    stopProgram(`今日已打招呼 ${dailyGreetCount} 个，达到 maxGreetsPerDay=${dailyLimit}（Boss 平台约 150/天上限，留余量防封）`);
+                    return true;
+                }
+                if (Number(OPTIONS.maxGreetsPerRun) > 0 && greetCount >= Number(OPTIONS.maxGreetsPerRun)) {
+                    stopProgram(`本次已打招呼 ${greetCount} 个，达到 maxGreetsPerRun=${OPTIONS.maxGreetsPerRun}`);
+                    return true;
+                }
+                if (Number(OPTIONS.maxRunHours) > 0 && hours >= Number(OPTIONS.maxRunHours)) {
+                    stopProgram(`已运行 ${hours.toFixed(1)} 小时，达到 maxRunHours=${OPTIONS.maxRunHours}`);
+                    return true;
+                }
+                if (Number(OPTIONS.maxRounds) > 0 && currentRound >= Number(OPTIONS.maxRounds)) {
+                    stopProgram(`已完成 ${currentRound} 轮，达到 maxRounds=${OPTIONS.maxRounds}`);
+                    return true;
+                }
+                return false;
+            };
 
             // 开始广播
             const startBroadcast = () => {
@@ -758,19 +950,27 @@
             };
 
             // 获取职位链接
-            const getJobHrefs = async () => {
-                try {
-                    const jobUl = await tools.endlessFind(SELECTORS.ZHIPIN.SEARCH.JOBLIST);
-                    const aList = jobUl.querySelectorAll(SELECTORS.ZHIPIN.SEARCH.JOBHREFS);
-                    const hrefs = Array.from(aList)
-                        .map(a => a.href)
-                        .slice(elsLen)
-                        .filter(href => !processedJobHrefs.has(href));
-                    return [hrefs, aList];
-                } catch (e) {
-                    logger.add('获取职位链接出错');
-                    throw new Error('获取职位链接出错');
+            const getJobHrefs = async (retry = 2) => {
+                for (let attempt = 0; attempt <= retry; attempt++) {
+                    try {
+                        const jobUl = await tools.endlessFind(SELECTORS.ZHIPIN.SEARCH.JOBLIST, 6000);
+                        const aList = jobUl.querySelectorAll(SELECTORS.ZHIPIN.SEARCH.JOBHREFS);
+                        const hrefs = Array.from(aList)
+                            .map(a => a.href)
+                            .slice(elsLen)
+                            .filter(href => !processedJobHrefs.has(href) && !processedStore[jobIdOf(href)]);
+                        return [hrefs, aList];
+                    } catch (e) {
+                        if (attempt < retry) {
+                            await tools.asyncSleep(1500);
+                            continue;
+                        }
+                        // 关键词搜不到结果时列表整个不存在，之前在这里无限抛错重试，会卡很久
+                        logger.add('没有找到职位列表（该关键词可能无结果），跳过本轮');
+                        return [[], []];
+                    }
                 }
+                return [[], []];
             };
 
             const resetRoundState = () => {
@@ -811,7 +1011,7 @@
                 while (true) {
                     let hrefs, els;
                     [hrefs, els] = await getJobHrefs();
-                    if (els.length === elsLen) {
+                    if (!els.length || els.length === elsLen) {
                         logger.add('没有更多职位了');
                         return false;
                     }
@@ -832,6 +1032,8 @@
 
             document.nextPage = nextPage
 
+            let greetFailStreak = 0; // 连续被平台拒绝的次数
+            let loopErrorStreak = 0; // loop 连续异常次数
             let pendingGreetTimer = null;
             let pendingGreetTitle = '';
             let pendingGreetDecision = null;
@@ -849,9 +1051,16 @@
                 clearPendingGreet();
                 pendingGreetTitle = title;
                 pendingGreetDecision = decision;
-                pendingGreetTimer = setTimeout(() => {
-                    logger.add(`职位 [${pendingGreetTitle}] 打招呼超时，已跳过`);
+                pendingGreetTimer = setTimeout(async () => {
+                    const timeoutTitle = pendingGreetTitle;
+                    logger.add(`职位 [${timeoutTitle}] 打招呼超时，已跳过`);
                     clearPendingGreet();
+                    await logAction({
+                        action: 'greet_timeout',
+                        scene: 'search',
+                        title: timeoutTitle,
+                        timeoutMs: OPTIONS.greetTimeout,
+                    });
                     loop();
                 }, OPTIONS.greetTimeout);
             };
@@ -892,20 +1101,90 @@
                 }
             };
 
-            // 获取职位信息
-            const getJobInfo = async (href) => {
-                // 打开窗口
-                tools.openTabNSetTimestamp(href, this.targets.detail);
-                // 接收职位信息
-                const info = await this.broadcast.receive(
-                    this.targets.detail,
-                    this.bcTypes.GET_JOB_INFO,
-                    OPTIONS.detailTimeout
-                ).catch(() => ({
+            // 中途去聊天页看一次新回复：Boss 回复后由聊天页自动发简历
+            const openChatPoll = async () => {
+                if (!OPTIONS.autoSendResumeOnReply || chatPolling) return;
+                if (this.pause) return;
+                const interval = Number(OPTIONS.chatPollIntervalMs) || 0;
+                if (interval > 0 && Date.now() - lastChatPollAt < interval) return;
+                chatPolling = true;
+                lastChatPollAt = Date.now();
+                try {
+                    logger.add('检查 Boss 新回复…');
+                    localStorage.setItem(CHAT_MODE_KEY, CHAT_MODE_POLL);
+                    // 丢掉上一次轮询残留的完成信号，否则会立刻“假完成”
+                    this.broadcast.clearInbox(this.targets.chat, this.bcTypes.RUN);
+                    tools.openTabNSetTimestamp(this.whiteList.chat, this.targets.chat);
+                    const timeout = Number(OPTIONS.chatPollTimeout) || 60000;
+                    const done = await this.broadcast
+                        .receive(this.targets.chat, this.bcTypes.RUN, timeout)
+                        .catch(() => null);
+                    if (!done) {
+                        logger.add(`回复检查超时（>${Math.round(timeout / 1000)}s），继续投岗位`);
+                    } else if (done.error) {
+                        logger.add('回复检查出错，已跳过本次检查');
+                    } else {
+                        logger.add('回复检查完成');
+                    }
+                } catch (e) {
+                    logger.add(`回复检查异常: ${e}`);
+                } finally {
+                    chatPolling = false;
+                }
+            };
+
+            // 打开详情页并等回传（单次）
+            const getJobInfoOnce = async (href) => {
+                const hrefKey = jobIdOf(href);
+                const detailWin = tools.openTabNSetTimestamp(href, this.targets.detail);
+                if (!detailWin) {
+                    return { skip: true, skipReason: '详情页被浏览器拦截（请允许 zhipin.com 弹出窗口）' };
+                }
+                await tools.asyncSleep(OPTIONS.detailOpenWaitMs);
+                const deadline = Date.now() + OPTIONS.detailTimeout;
+                while (true) {
+                    const remain = deadline - Date.now();
+                    if (remain <= 0) break;
+                    const info = await this.broadcast
+                        .receive(this.targets.detail, this.bcTypes.GET_JOB_INFO, remain)
+                        .catch(() => null);
+                    if (!info) break;
+                    // 上一份岗位迟到的回传，丢掉继续等本轮岗位
+                    if (info.href && jobIdOf(info.href) !== hrefKey) {
+                        logger.add('收到的详情属于上一个岗位，已丢弃并继续等待');
+                        continue;
+                    }
+                    // 详情页自己报错（风控页 / DOM 未就绪 / 解析失败），快速跳过，不等满超时
+                    if (info.error) {
+                        return { skip: true, skipReason: info.error };
+                    }
+                    return info;
+                }
+                return {
                     skip: true,
+                    timeout: true,
                     skipReason: `获取职位详情超时（>${(OPTIONS.detailTimeout / 1000).toFixed(0)}s）`,
-                }));
-                return info;
+                };
+            };
+
+            // 获取职位信息（超时重试）
+            const getJobInfo = async (href) => {
+                const retry = Math.max(0, Number(OPTIONS.detailRetry) || 0);
+                let last = null;
+                for (let attempt = 0; attempt <= retry; attempt++) {
+                    if (this.pause) {
+                        return { skip: true, skipReason: '当前已暂停，跳过该岗位' };
+                    }
+                    last = await getJobInfoOnce(href);
+                    if (!last.skip) return last;
+                    // 只有“超时”值得重试；风控/DOM异常/非立即沟通直接放弃
+                    if (!last.timeout) return last;
+                    if (attempt < retry) {
+                        logger.add(`详情页 ${(OPTIONS.detailTimeout / 1000).toFixed(0)}s 未回传，重试第 ${attempt + 1} 次`);
+                        await tools.asyncSleep(500);
+                    }
+                }
+                return last;
             };
 
             // 添加到聊天列表
@@ -921,9 +1200,16 @@
                             return resp.json();
                         }).then(resp => {
                             if (resp.code === 0) return resolve(resp);
-                            const msg = resp?.zpData?.bizData?.chatRemindDialog?.title || resp?.message || '未知错误';
+                            const biz = resp?.zpData?.bizData || {};
+                            const dialog = biz.chatRemindDialog || {};
+                            const title = dialog.title || '';
+                            const body = dialog.content || dialog.text || dialog.message
+                                || dialog.desc || dialog.subTitle || dialog.tips || '';
+                            const snippet = JSON.stringify(dialog || biz || resp).slice(0, 260);
+                            const msg = [title, body].filter(Boolean).join(' / ') || resp?.message || '未知错误';
                             logger.add(`打招呼失败: ${msg}`);
-                            reject(new Error(`biz_fail:${msg}`));
+                            logger.add(`平台原文: ${snippet}`);
+                            reject(new Error(`biz_fail:${msg} || ${snippet}`));
                         }).catch(err => {
                             reject(err instanceof Error ? err : new Error(String(err)));
                         });
@@ -953,12 +1239,17 @@
                     const finalTitle = pendingGreetTitle;
                     clearPendingGreet();
                     if (data.success) {
-                        logger.add(`打招呼成功`);
+                        greetFailStreak = 0;
+                        logger.add(data.verified === false
+                            ? '打招呼已发出（页面还没刷新出气泡，稍后可人工确认）'
+                            : '打招呼成功');
                         await logAction({
                             action: 'greet_sent',
                             scene: 'search',
                             title: finalTitle,
                             resumeIndex: finalDecision?.resumeIndex ?? OPTIONS.resumeIndex,
+                            verified: data.verified ?? null,
+                            confirmed: data.confirmed ?? null,
                         });
                     }
                     // 出错了
@@ -979,6 +1270,10 @@
             const chatListener = () => {
                 this.broadcast.on(this.bcTypes.RUN, async (from, data) => {
                     if (from !== this.targets.chat) return;
+                    // 中途轮询的完成信号：交给 openChatPoll 里的 receive 处理，这里不推进轮次
+                    if (data && typeof data === 'object' && data.poll) {
+                        return;
+                    }
                     if (data) {
                         logger.divider();
                         const hasNext = await nextPage();
@@ -1012,6 +1307,7 @@
                         logger.add('暂停中...');
                         return;
                     }
+                    if (hitLimit()) return;
                     logger.divider();
                     // 判断职位链接是否为空
                     if (jobHrefs.length === 0) {
@@ -1023,6 +1319,12 @@
                         }
                         logger.add('开始处理聊天消息');
                         tools.openTabNSetTimestamp(this.whiteList.chat, this.targets.chat);
+                        return;
+                    }
+                    // 处理岗位期间，按间隔去聊天页看一次新回复（Boss 回复后自动发简历）
+                    await openChatPoll();
+                    if (this.pause) {
+                        logger.add('暂停中...');
                         return;
                     }
                     // 抽取第一个
@@ -1037,6 +1339,7 @@
                         await logAction({
                             action: 'job_skip',
                             scene: 'search',
+                            href,
                             title: jobInfo.title || null,
                             salary: jobInfo.salary || null,
                             detail: jobInfo.detail || null,
@@ -1044,7 +1347,7 @@
                         });
                         return loop();
                     }
-                    processedJobHrefs.add(href);
+                    rememberProcessed(href);
                     // 如果聊过，下一个
                     if (jobInfo.talked) {
                         logger.add(`职位 [${jobInfo.title}] 已经聊过，下一个`);
@@ -1081,6 +1384,11 @@
                         });
                         // 判断是否有提醒返回
                         addToChatList(jobInfo.addUrl).then(async () => {
+                            // 只有平台真的建立了沟通才计数，失败不占当日额度
+                            greetCount += 1;
+                            dailyGreetCount = bumpDailyCount();
+                            const dailyLimitText = Number(OPTIONS.maxGreetsPerDay) > 0 ? `（今日 ${dailyGreetCount}/${OPTIONS.maxGreetsPerDay}）` : '';
+                            logger.add(`本次已打招呼 ${greetCount} 个${dailyLimitText}`);
                             await logAction({
                                 action: 'chat_open_requested',
                                 scene: 'search',
@@ -1089,8 +1397,14 @@
                                 resumeIndex: decision.resumeIndex,
                             });
                             armPendingGreet(jobInfo.title, decision);
-                            tools.openTabNSetTimestamp(jobInfo.chatUrl, this.targets.chatGreet);
+                            const greetWin = tools.openTabNSetTimestamp(jobInfo.chatUrl, this.targets.chatGreet);
+                            if (!greetWin) {
+                                logger.add('打招呼页被浏览器拦截（请允许 zhipin.com 弹窗），跳过');
+                                clearPendingGreet();
+                                loop();
+                            }
                         }).catch(async (err) => {
+                            greetFailStreak += 1;
                             await logAction({
                                 action: 'greet_queue_failed',
                                 scene: 'search',
@@ -1098,9 +1412,23 @@
                                 resumeIndex: decision.resumeIndex,
                                 addUrl: jobInfo.addUrl,
                                 chatUrl: jobInfo.chatUrl,
+                                streak: greetFailStreak,
                                 reason: String(err),
                             });
                             clearPendingGreet();
+                            const reasonText = String(err);
+                            const limitHit = /上限|次数|限制|频繁|稍后再试/.test(reasonText);
+                            if (limitHit) {
+                                stopProgram(`平台提示触到限额/风控：${reasonText.slice(0, 120)}`);
+                                return;
+                            }
+                            // 连续被拒多半是触到平台限额/风控，继续硬打只会更糟
+                            if (greetFailStreak >= 5) {
+                                stopProgram(`连续 ${greetFailStreak} 次打招呼被平台拒绝（${String(err).slice(0, 80)}），疑似触到日限或风控`);
+                                return;
+                            }
+                            // 单次被拒也降速，避免连续触发
+                            await tools.asyncSleep(3000);
                             loop();
                         });
                     }
@@ -1120,6 +1448,12 @@
                 } catch (e) {
                     console.log(e);
                     logger.add(`循环时出错: ${e}`);
+                    loopErrorStreak += 1;
+                    if (loopErrorStreak >= 3) {
+                        loopErrorStreak = 0;
+                        logger.add('连续出错，跳过本轮');
+                        return handleRoundExhausted();
+                    }
                     loop();
                 }
             };
@@ -1129,9 +1463,26 @@
                 let stableRounds = 0;
                 let lastCount = 0;
                 let lastScrollY = -1;
+                let stoppedByCap = false;
+                let missingRounds = 0;
+                const maxJobs = Math.max(0, Number(OPTIONS.preloadMaxJobs) || 0);
                 for (let round = 1; round <= OPTIONS.preloadMaxRounds; round++) {
-                    const jobUl = await tools.endlessFind(SELECTORS.ZHIPIN.SEARCH.JOBLIST).catch(() => null);
+                    const jobUl = await tools.endlessFind(SELECTORS.ZHIPIN.SEARCH.JOBLIST, 5000).catch(() => null);
                     const currentCount = jobUl ? jobUl.querySelectorAll(SELECTORS.ZHIPIN.SEARCH.JOBHREFS).length : 0;
+                    if (!jobUl) {
+                        missingRounds += 1;
+                        if (missingRounds >= 3) {
+                            logger.add('职位列表一直没出现，本轮跳过预加载');
+                            break;
+                        }
+                    } else {
+                        missingRounds = 0;
+                    }
+                    // 岗位数量上限：列表里岗位越多，详情页打开越慢、越容易被风控
+                    if (maxJobs && currentCount >= maxJobs) {
+                        stoppedByCap = true;
+                        break;
+                    }
                     window.scrollBy({ top: OPTIONS.preloadScrollPixels, left: 0, behavior: 'smooth' });
                     await tools.asyncSleep(OPTIONS.preloadScrollWaitMs);
                     await activatePreloadCard(round);
@@ -1151,9 +1502,15 @@
                         break;
                     }
                 }
+                if (stoppedByCap) {
+                    logger.add(`预加载已到岗位上限 ${maxJobs}，提前结束`);
+                }
                 const finalJobUl = document.querySelector(SELECTORS.ZHIPIN.SEARCH.JOBLIST);
                 const finalCount = finalJobUl ? finalJobUl.querySelectorAll(SELECTORS.ZHIPIN.SEARCH.JOBHREFS).length : 0;
                 logger.add(`预加载完成，当前已加载岗位数：${finalCount}`);
+                if (finalCount > 150) {
+                    logger.add(`提示：岗位数偏多（${finalCount}），详情页会更慢也更容易被风控，建议把 frontend.preloadMaxJobs 调小到 80~120`);
+                }
             };
 
             const pickNextKeyword = () => {
@@ -1166,6 +1523,7 @@
             };
 
             const startRound = async () => {
+                if (hitLimit()) return;
                 resetRoundState();
                 currentRound += 1;
                 const keyword = pickNextKeyword();
@@ -1182,6 +1540,9 @@
                 loop();
             };
 
+            // 应用后端下发的前端配置（实现在模块作用域，聊天页复用同一份逻辑）
+            const applyFrontendConfig = (frontend) => applyFrontendOptions(frontend, (m) => logger.add(m));
+
             // 主函数
             const main = async () => {
                 started = true;
@@ -1194,7 +1555,7 @@
                     return null;
                 });
                 if (clientConfig && clientConfig.frontend) {
-                    Object.assign(OPTIONS, clientConfig.frontend);
+                    applyFrontendConfig(clientConfig.frontend);
                     logger.add('获取前端配置成功');
                 }
                 if (clientConfig && Array.isArray(clientConfig.tags) && clientConfig.tags.length) {
@@ -1207,12 +1568,27 @@
                 if (typeof tagIdx === 'number' && this.tags.length) {
                     currentTagIdx = ((tagIdx % this.tags.length) + this.tags.length) % this.tags.length - 1;
                 }
+                // 用后端日志校准当日计数：localStorage 可能被清空，也统计不到历史
+                try {
+                    const stats = await api.getGreetStats();
+                    if (stats && typeof stats.greeted === 'number') {
+                        dailyGreetCount = Math.max(dailyGreetCount, stats.greeted);
+                        const limit = Number(OPTIONS.maxGreetsPerDay) || 0;
+                        logger.add(`今日已在 Boss 建立沟通 ${stats.greeted} 个` + (limit ? `（脚本上限 ${limit}）` : ''));
+                    }
+                } catch (e) {
+                    logger.add('今日沟通数校准失败，按本地计数继续');
+                }
+
                 if (clientConfig && typeof clientConfig.introduce === 'string' && clientConfig.introduce) {
                     this.introduce = clientConfig.introduce;
                     logger.add('获取自我介绍成功');
                 } else {
                     this.introduce = await api.getIntroduce();
                     logger.add('获取自我介绍成功(旧接口)');
+                }
+                if (this.introduce && this.introduce.length > 180) {
+                    logger.add(`提示：招呼语 ${this.introduce.length} 字，偏长，Boss 首条消息可能被截断，建议控制在 160 字内`);
                 }
                 await startRound();
             };
@@ -1229,80 +1605,112 @@
         }
 
         // 详情页
-        __detail() {
+        async __detail() {
             // 注册广播
             const startBroadcast = () => {
                 this.__broadcast(this.targets.detail);
             };
             startBroadcast();
 
-            // 获取职位信息
-            const getJobInfo = () => {
-                const chatBtn = document.querySelector(SELECTORS.ZHIPIN.DETAIL.STARTCHAT);
-                const nameBox = document.querySelector(SELECTORS.ZHIPIN.DETAIL.NAMEBOX);
-                const title = nameBox.querySelector(SELECTORS.ZHIPIN.DETAIL.JOBNAME).innerText;
-                const salary = nameBox.querySelector(SELECTORS.ZHIPIN.DETAIL.SALARY).innerText;
-                const detail = document.querySelector(SELECTORS.ZHIPIN.DETAIL.DETAIL).innerText;
-                const actionText = chatBtn ? chatBtn.innerText.trim() : '';
-                const chatUrl = chatBtn && chatBtn.getAttribute(SELECTORS.ZHIPIN.DETAIL.CHATURL);
-                const addUrl = chatBtn && chatBtn.dataset.url;
-                let skip = false;
-                let skipReason = '';
+            const sleep = tools.asyncSleep;
 
-                if (!chatBtn) {
-                    skip = true;
-                    skipReason = '未找到立即沟通按钮';
-                } else if (actionText.indexOf('立即沟通') === -1) {
-                    skip = true;
-                    skipReason = `按钮为 [${actionText || '未知'}]，疑似网申岗位`;
-                } else if (!chatUrl || !addUrl) {
-                    skip = true;
-                    skipReason = '缺少聊天链接，疑似异常岗位';
+            // 风控 / 验证码 / 岗位下线页
+            const detectBlockPage = () => {
+                const title = document.title || '';
+                if (/安全验证|验证码|访问异常|操作频繁|登录/.test(title)) return title.trim();
+                if (document.querySelector('#captcha, .captcha, .verify-wrap, .boss-verify')) return '验证码页面';
+                return '';
+            };
+
+            // 等关键 DOM 就绪：页面没渲染完就读取，会直接抛错并让搜索页干等超时
+            const waitReady = async () => {
+                const deadline = Date.now() + OPTIONS.detailReadyTimeout;
+                while (Date.now() < deadline) {
+                    if (document.querySelector(SELECTORS.ZHIPIN.DETAIL.STARTCHAT)) return { ready: true };
+                    const nameBox = document.querySelector(SELECTORS.ZHIPIN.DETAIL.NAMEBOX);
+                    if (nameBox && nameBox.querySelector(SELECTORS.ZHIPIN.DETAIL.JOBNAME)) return { ready: true };
+                    // 职位正文出现也算就绪：网申岗位可能没有“立即沟通”按钮，交给 readJobInfo 判定
+                    if (document.querySelector(SELECTORS.ZHIPIN.DETAIL.DETAIL)) return { ready: true };
+                    const blocked = detectBlockPage();
+                    if (blocked) return { ready: false, error: `详情页被风控拦截（${blocked}），建议降低投递速度` };
+                    await sleep(150);
                 }
-
+                const blocked = detectBlockPage();
+                if (blocked) return { ready: false, error: `详情页被风控拦截（${blocked}），建议降低投递速度` };
                 return {
-                    title,
-                    salary,
-                    detail,
-                    actionText,
-                    chatUrl,
-                    addUrl,
-                    skip,
-                    skipReason,
-                    talked: chatBtn && chatBtn.dataset.isfriend === 'true',
+                    ready: false,
+                    error: `详情页 ${(OPTIONS.detailReadyTimeout / 1000).toFixed(0)}s 内未渲染出关键元素`,
                 };
             };
-            const jobInfo = getJobInfo();
 
-            // 来自搜索页
-            const fromSearchPage = () => {
-                // 把职位信息发送给搜索页
-                this.broadcast.send(this.targets.search, this.bcTypes.GET_JOB_INFO, jobInfo);
+            // 读取职位信息（任何一步失败都回报 error，保证搜索页能立刻往下走）
+            const readJobInfo = () => {
+                try {
+                    const chatBtn = document.querySelector(SELECTORS.ZHIPIN.DETAIL.STARTCHAT);
+                    const nameBox = document.querySelector(SELECTORS.ZHIPIN.DETAIL.NAMEBOX);
+                    const titleEl = nameBox && nameBox.querySelector(SELECTORS.ZHIPIN.DETAIL.JOBNAME);
+                    const salaryEl = nameBox && nameBox.querySelector(SELECTORS.ZHIPIN.DETAIL.SALARY);
+                    const detailEl = document.querySelector(SELECTORS.ZHIPIN.DETAIL.DETAIL);
+                    if (!titleEl || !detailEl) {
+                        return { error: '详情页结构异常（缺少职位名称或职位描述）', href: location.href };
+                    }
+                    const title = titleEl.innerText.trim();
+                    const salary = salaryEl ? salaryEl.innerText.trim() : '';
+                    const detail = detailEl.innerText.trim();
+                    const actionText = chatBtn ? chatBtn.innerText.trim() : '';
+                    const chatUrl = chatBtn && chatBtn.getAttribute(SELECTORS.ZHIPIN.DETAIL.CHATURL);
+                    const addUrl = chatBtn && chatBtn.dataset.url;
+                    let skip = false;
+                    let skipReason = '';
+
+                    // “继续沟通”= 已经打过招呼的岗位，同样是可沟通状态，不能当成网申跳过
+                    const canChat = actionText.indexOf('立即沟通') !== -1 || actionText.indexOf('继续沟通') !== -1;
+                    if (!chatBtn) {
+                        skip = true;
+                        skipReason = '未找到沟通按钮';
+                    } else if (!canChat) {
+                        skip = true;
+                        skipReason = `按钮为 [${actionText || '未知'}]，疑似网申岗位`;
+                    } else if (!chatUrl || !addUrl) {
+                        skip = true;
+                        skipReason = '缺少聊天链接，疑似异常岗位';
+                    }
+
+                    return {
+                        title,
+                        salary,
+                        detail,
+                        actionText,
+                        chatUrl,
+                        addUrl,
+                        skip,
+                        skipReason,
+                        // “继续沟通”也说明已经聊过，避免重复打招呼被平台拒
+                        talked: !!chatBtn && (chatBtn.dataset.isfriend === 'true'
+                            || actionText.indexOf('继续沟通') !== -1),
+                        href: location.href,
+                    };
+                } catch (e) {
+                    return { error: `解析详情页失败: ${e && e.message ? e.message : e}`, href: location.href };
+                }
             };
 
-            // 来自聊天页
-            const fromChatPage = () => {
-                // 把职位信息发送给聊天页
-                this.broadcast.send(
-                    this.targets.chat,
-                    this.bcTypes.GET_JOB_INFO,
-                    jobInfo
-                ).then(() => {
+            // 主函数：先等页面就绪，再把结果回传；无论成功失败都要回传
+            const main = async () => {
+                const ready = await waitReady();
+                const jobInfo = ready.ready ? readJobInfo() : { error: ready.error, href: location.href };
+
+                // 来源判断：优先按 window.name，其次按聊天页的时间戳
+                const fromSearch = window.name === this.targets.detail;
+                const fromChat = !fromSearch && Date.now() - tools.getTimestamp(this.targets.chat) < OPTIONS.timestampTimeout;
+
+                if (fromSearch) {
+                    await this.broadcast.send(this.targets.search, this.bcTypes.GET_JOB_INFO, jobInfo);
+                    return;
+                }
+                if (fromChat) {
+                    await this.broadcast.send(this.targets.chat, this.bcTypes.GET_JOB_INFO, jobInfo);
                     window.close();
-                });
-            };
-
-            // 主函数
-            const main = () => {
-                // 判断来源
-                const now = new Date().getTime();
-                const isFromSearch = now - tools.getTimestamp(this.targets.detail) < OPTIONS.timestampTimeout && window.name === this.targets.detail;
-                const isFromChat = now - tools.getTimestamp(this.targets.chat) < OPTIONS.timestampTimeout;
-
-                if (isFromSearch) {
-                    fromSearchPage();
-                } else if (isFromChat) {
-                    fromChatPage();
                 }
             };
             main();
@@ -1315,21 +1723,140 @@
                 this.__broadcast(target);
             };
 
-            // 发送消息
-            const sendMsg = (text) => {
-                return new Promise(async (resolve, reject) => {
-                    try {
-                        const ipt = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.CHATINPUT);
-                        ipt.innerText = text;
-                        await tools.asyncSleep(600);
-                        const btn = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.MSGSEND);
-                        btn.click();
-                        resolve();
-                    } catch (e) {
-                        reject();
-                    }
-                })
+            // 动作日志：必须定义在 __chat 作用域，打招呼(sayHi)和聊天(chat)两条链路都要用。
+            // 之前只在 chat() 内部定义，sayHi() 引用不到 → ReferenceError → 回执发不出去 → 必然超时。
+            const actionApi = new Api();
+            const logAction = async (payload) => {
+                try {
+                    await actionApi.logAction(payload);
+                } catch (e) {
+                    console.log('logAction failed', e);
+                }
             };
+
+            // 发送消息（真正的实现放在后面 sendMsg，这里只保留日志客户端）
+
+            // 校验消息是否真的出现在聊天记录里
+            // 忽略空白差异，并允许气泡类名变化：先找自己发的气泡，再退回所有消息文本
+            const findMyMsg = (text) => {
+                const norm = (str) => (str || '').replace(/\s+/g, '');
+                const head = norm(text).slice(0, 8);
+                if (!head) return null;
+                const mine = Array.from(document.querySelectorAll('.item-myself'));
+                const hit = mine.find(el => norm(el.innerText).indexOf(head) !== -1);
+                if (hit) return hit;
+                const bubbles = Array.from(document.querySelectorAll('.message-content .text, .chat-message .text'));
+                return bubbles.find(el => norm(el.innerText).indexOf(head) !== -1) || null;
+            };
+
+            // 发送失败时的现场快照，用来区分“真没发出”和“选择器不对”
+            const describeChatDom = (ipt) => {
+                const mine = document.querySelectorAll('.item-myself').length;
+                const friend = document.querySelectorAll('.item-friend').length;
+                const texts = Array.from(document.querySelectorAll('.message-content .text'));
+                const left = ((ipt && (ipt.innerText || ipt.value)) || '').trim().length;
+                const last = texts[texts.length - 1];
+                return `自己${mine}/对方${friend}/文本${texts.length}/输入框残留${left}字/末条「${((last && last.innerText) || '').slice(0, 20)}」`;
+            };
+
+            const verifyMsgSent = async (text, timeout = 3000) => {
+                const deadline = Date.now() + timeout;
+                while (Date.now() < deadline) {
+                    if (findMyMsg(text)) return true;
+                    await tools.asyncSleep(250);
+                }
+                return false;
+            };
+
+            // 把文本真正写进聊天输入框。
+            // 只设 innerText 的话，Boss 的编辑器内部状态还是空的，点发送等于没点。
+            const fillChatInput = (ipt, text) => {
+                ipt.focus();
+                if (ipt.isContentEditable) {
+                    // 清空已有内容
+                    ipt.innerHTML = '';
+                    // 首选 execCommand：会触发编辑器的 beforeinput/input，框架能感知到
+                    let ok = false;
+                    try {
+                        ok = document.execCommand('insertText', false, text);
+                    } catch (e) {
+                        ok = false;
+                    }
+                    const written = (ipt.innerText || '').replace(/\s+/g, '');
+                    if (!ok || written.length < Math.min(4, text.length)) {
+                        // 兜底：直接写 + 手动派发 input 事件
+                        ipt.innerText = text;
+                        const range = document.createRange();
+                        range.selectNodeContents(ipt);
+                        range.collapse(false);
+                        const sel = window.getSelection();
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                        try {
+                            ipt.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+                        } catch (e) {
+                            ipt.dispatchEvent(new Event('input', { bubbles: true }));
+                        }
+                        ipt.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    return true;
+                }
+                ipt.value = text;
+                ipt.dispatchEvent(new Event('input', { bubbles: true }));
+                ipt.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            };
+
+            const pressEnter = (el) => {
+                const opts = { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 };
+                el.dispatchEvent(new KeyboardEvent('keydown', opts));
+                el.dispatchEvent(new KeyboardEvent('keypress', opts));
+                el.dispatchEvent(new KeyboardEvent('keyup', opts));
+            };
+
+            const inputEmptied = (ipt) => ((ipt.innerText || ipt.value || '').trim().length === 0);
+
+            const isDisabled = (el) => !el || el.disabled === true || /disabled/.test(el.className || '');
+
+            /**
+             * 发送消息：写入 → 点发送（不可用则回车）→ 校验是否真的发出
+             * @returns {Promise<{via: string}>} 失败会 throw
+             */
+            const sendMsg = async (text) => {
+                const ipt = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.CHATINPUT, 8000);
+                fillChatInput(ipt, text);
+                await tools.asyncSleep(500);
+
+                if (inputEmptied(ipt)) {
+                    throw new Error('输入框没写进去（内容为空）');
+                }
+
+                let via = 'btn';
+                const btn = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.MSGSEND, 5000).catch(() => null);
+                if (btn && !isDisabled(btn)) {
+                    btn.click();
+                } else {
+                    via = 'enter';
+                    pressEnter(ipt);
+                }
+                await tools.asyncSleep(800);
+
+                // 输入框被清空 = 应用已受理；气泡出现 = 更确定的证据
+                if (inputEmptied(ipt)) return { via, confirmed: 'cleared' };
+                if (await verifyMsgSent(text, 2000)) return { via, confirmed: 'bubble' };
+
+                // 还有内容：换一种发送方式再试一次
+                via = 'enter-retry';
+                pressEnter(ipt);
+                await tools.asyncSleep(900);
+                if (inputEmptied(ipt)) return { via, confirmed: 'cleared' };
+                if (await verifyMsgSent(text, 2000)) return { via, confirmed: 'bubble' };
+
+                const snapshot = describeChatDom(ipt);
+                if (logger) logger.add(`消息发送失败现场: ${snapshot}`);
+                throw new Error(`点了发送但消息没出现在聊天记录里（${snapshot}）`);
+            };
+
 
             // 打招呼
             const sayHi = async () => {
@@ -1348,29 +1875,41 @@
                         } else {
                             throw new Error('心跳失联');
                         }
+                    }).catch(() => {
+                        // 搜索页已经不在（关了/跳走了），停止心跳即可，不再打扰控制台
                     });
                 };
                 loop();
 
+                let ack = { success: false };
                 try {
                     const greetDecision = await this.broadcast.sendAndReceive(this.targets.search, this.bcTypes.SAY_HI);
                     const introduce = greetDecision.introduce;
-                    await sendMsg(introduce);
+                    const sent = await sendMsg(introduce);
+                    // sendMsg 已确认受理（输入框被清空或气泡已出现），这里再补一次气泡校验
+                    const verified = sent.confirmed === 'bubble' || await verifyMsgSent(introduce, 1500);
+                    ack = { success: true, verified, confirmed: sent.confirmed };
                     await logAction({
                         action: 'greet_message_sent',
                         scene: 'chat_greet',
                         resumeIndex: greetDecision.resumeIndex ?? OPTIONS.resumeIndex,
-                    });
-                    this.broadcast.send(this.targets.search, this.bcTypes.SAY_HI, { success: true }).then(() => {
-                        this.broadcast.destroy();
+                        verified,
+                        confirmed: sent.confirmed,
+                        via: sent.via,
+                        length: (introduce || '').length,
                     });
                 } catch (e) {
+                    ack = { success: false, reason: String(e) };
                     await logAction({
                         action: 'greet_message_failed',
                         scene: 'chat_greet',
                         reason: String(e),
                     });
-                    this.broadcast.send(this.targets.search, this.bcTypes.SAY_HI, { success: false }).then(() => {
+                } finally {
+                    // 无论成功、失败还是日志报错，都必须回执；否则搜索页只能干等到 greetTimeout
+                    this.broadcast.send(this.targets.search, this.bcTypes.SAY_HI, ack).then(() => {
+                        this.broadcast.destroy();
+                    }).catch(() => {
                         this.broadcast.destroy();
                     });
                 }
@@ -1471,36 +2010,376 @@
                 return await getMsgs();
             };
 
-            // 发送简历
-            const sendResume = async (resumeIndex = OPTIONS.resumeIndex) => {
-                const sendBtn = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.RESUMESEND);
+            // ---------- 简历发送：按配置指定简历，而不是平台默认/模板简历 ----------
+            const isVisible = (el) => {
+                if (!el || !el.getBoundingClientRect) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+
+            const resumeConfig = () => {
+                const cfg = (OPTIONS.resume && typeof OPTIONS.resume === 'object') ? OPTIONS.resume : {};
+                const legacy = String(OPTIONS.resumeMatch || '').split(',').map(s => s.trim()).filter(Boolean);
+                const match = Array.isArray(cfg.match) ? cfg.match.slice() : [];
+                const keywords = [cfg.name, ...match, ...legacy]
+                    .filter(Boolean)
+                    .map(s => String(s).trim())
+                    .filter(Boolean);
+                return {
+                    name: cfg.name || '',
+                    keywords: Array.from(new Set(keywords)),
+                    exclude: Array.isArray(cfg.exclude) && cfg.exclude.length ? cfg.exclude : ['在线简历', '模板简历'],
+                    preferAttachment: cfg.preferAttachment !== false,
+                    strict: cfg.strict !== false,
+                    followUpText: cfg.followUpText === undefined ? '已发送，请查收' : cfg.followUpText,
+                };
+            };
+
+            const visiblePanels = () => Array.from(document.querySelectorAll(
+                '.panel-resume, .resume-list, .dialog-container, .boss-dialog, .resume-select, .dialog-wrap'
+            ))
+                .filter(isVisible)
+                // 小面板更可能是真正的弹窗，大面板往往是整页容器
+                .sort((a, b) => ((a.innerText || '').length - (b.innerText || '').length));
+
+            const allPanels = () => Array.from(document.querySelectorAll(
+                '.panel-resume, .resume-list, .dialog-container, .boss-dialog, .resume-select, .dialog-wrap'
+            ));
+
+            const panelText = () => visiblePanels().map(el => el.innerText || '').join(' ').replace(/\s+/g, ' ');
+
+            // 找“发送简历”按钮：优先工具栏里带“简历”字样的按钮，找不到再退回旧选择器
+            const findResumeSendBtn = () => {
+                const btns = Array.from(document.querySelectorAll('.toolbar-btn, .chat-toolbar .btn, .toolbar .btn'));
+                const hit = btns.find(el => {
+                    const text = `${el.innerText || ''} ${el.getAttribute('title') || ''} ${el.getAttribute('aria-label') || ''}`;
+                    return text.indexOf('简历') !== -1;
+                });
+                return hit || document.querySelector(SELECTORS.ZHIPIN.CHAT.RESUMESEND);
+            };
+
+            // 面板里可点的简历项：覆盖 li / 卡片 / radio-label / 纯文本块
+            const collectResumeItems = (requireVisible = true) => {
+                const items = [];
+                const seen = new Set();
+                const push = (el) => {
+                    if (!el || seen.has(el)) return;
+                    if (requireVisible && !isVisible(el)) return;
+                    const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!text || text.length > 120) return;
+                    seen.add(el);
+                    items.push({ el, text });
+                };
+                // 后台标签里弹窗可能量出 0 尺寸，requireVisible=false 时不做可见性过滤
+                const panels = requireVisible ? visiblePanels() : allPanels();
+                for (const panel of panels) {
+                    // 1) 单选/复选：取它所在的 label 或父节点
+                    panel.querySelectorAll('input[type="radio"], input[type="checkbox"]').forEach((input) => {
+                        push(input.closest('label') || input.parentElement);
+                    });
+                    // 2) 常见列表项
+                    panel.querySelectorAll('li, .resume-item, [class*="resume-item"], [class*="resumeItem"], [class*="resume-card"], [class*="resume_card"]').forEach(push);
+                    // 3) 兜底：文本像简历名的叶子节点
+                    if (!items.length) {
+                        panel.querySelectorAll('div, label, a, p').forEach((el) => {
+                            if (el.querySelector('div, label, a, p, ul, li')) return;
+                            const t = (el.textContent || '').trim();
+                            if (!t || t.length > 80) return;
+                            if (!/\.(pdf|docx?)\b|在线简历|附件简历|我的简历/i.test(t)) return;
+                            push(el);
+                        });
+                    }
+                }
+                return items;
+            };
+
+            // 弹窗结构快照：标签 + class + 文本，用来定位真实 DOM
+            const dumpPanelStructure = (limit = 30) => {
+                const iframes = document.querySelectorAll('iframe').length;
+                const panels = visiblePanels();
+                if (!panels.length) return `无可见弹窗（页面 iframe=${iframes}）`;
+                const chunks = panels.slice(0, 2).map((panel, idx) => {
+                    const cls = typeof panel.className === 'string' ? panel.className.trim().split(/\s+/).slice(0, 2).join('.') : '';
+                    const nodes = [];
+                    for (const el of panel.querySelectorAll('*')) {
+                        if (nodes.length >= limit) break;
+                        const c = typeof el.className === 'string' ? el.className.trim().split(/\s+/).slice(0, 2).join('.') : '';
+                        const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                        if (!c && !t) continue;
+                        if (t.length > 32) continue;
+                        nodes.push(`${el.tagName.toLowerCase()}${c ? '.' + c : ''}「${t.slice(0, 18)}」`);
+                    }
+                    return `#${idx} ${panel.tagName.toLowerCase()}.${cls} ` + nodes.join(' | ');
+                });
+                const focusText = `hasFocus=${document.hasFocus()} hidden=${document.hidden}`;
+                return `iframe=${iframes} ${focusText} 面板数=${panels.length} ` + chunks.join(' || ').slice(0, 1400);
+            };
+
+            // 简历弹窗现场快照：工具栏按钮、命中的面板、候选简历数量
+            const describeResumeUi = () => {
+                const toolbar = Array.from(document.querySelectorAll('.toolbar-btn'))
+                    .map(el => (el.innerText || '').trim() || el.getAttribute('title') || '(无文字)')
+                    .slice(0, 12);
+                const panels = ['.panel-resume', '.resume-list', '.dialog-container', '.boss-dialog', '.resume-select', '.dialog-wrap']
+                    .filter(sel => document.querySelector(sel));
+                return `工具栏[${toolbar.join('|') || '空'}] 面板[${panels.join(',') || '无'}] 简历项${collectResumeItems().length}`;
+            };
+
+            // 切到“附件简历”页签
+            const switchToAttachmentTab = async () => {
+                const allTabs = Array.from(document.querySelectorAll('[role="tab"], .tab-item, .resume-tab, .panel-resume .tab, .dialog-container .tab'));
+                const tabs = allTabs.filter(isVisible).length ? allTabs.filter(isVisible) : allTabs;
+                const tab = tabs.find(el => /附件/.test(el.textContent || ''));
+                if (!tab) return false;
+                tab.click();
+                await tools.asyncSleep(500);
+                return true;
+            };
+
+            const findConfirmBtn = () => {
+                const panels = visiblePanels().length ? visiblePanels() : allPanels();
+                for (const panel of panels) {
+                    const btn = panel.querySelector('.btn-sure-v2, .btn-confirm, .btn-primary, .btn-v2');
+                    if (btn && isVisible(btn)) return btn;
+                    // 按文案兜底：Boss 的“发送”按钮类名不固定
+                    const byText = Array.from(panel.querySelectorAll('button, .btn, [role="button"]'))
+                        .find(el => /^(发送|确认|确定|发送简历)$/.test((el.innerText || '').trim()) && isVisible(el));
+                    if (byText) return byText;
+                }
+                return document.querySelector(SELECTORS.ZHIPIN.CHAT.RESUMESENDCONFIRM)
+                    || document.querySelector(SELECTORS.ZHIPIN.CHAT.RESUMEMODALCONFIRM);
+            };
+
+            const closeResumePanel = () => {
+                const btn = document.querySelector('.panel-resume .close, .dialog-container .close, .icon-close, .close-icon');
+                if (btn) btn.click();
+            };
+
+            // 发送后回执校验：聊天记录里出现“点击预览附件简历”才算真的发出去了
+            const verifyResumeSent = async (timeout = 3000) => {
+                const deadline = Date.now() + timeout;
+                while (Date.now() < deadline) {
+                    const greens = Array.from(document.querySelectorAll('.boss-green'));
+                    if (greens.some(el => (el.innerText || '').indexOf('点击预览附件简历') !== -1)) return true;
+                    await tools.asyncSleep(300);
+                }
+                return false;
+            };
+
+            // 同一次运行里发简历失败过的联系人，不再反复重试，避免一直弹窗
+            const failedResumeContacts = new Set();
+
+            // 发过简历的记录（跨页面刷新有效）：轮询会反复重载聊天页，靠它保证不重复发送
+            const SENT_RESUME_KEY = '__zhipin_resume_sent';
+            const sentResumeRecord = () => {
+                try {
+                    const rec = JSON.parse(localStorage.getItem(SENT_RESUME_KEY) || '{}');
+                    return rec && typeof rec === 'object' ? rec : {};
+                } catch (e) {
+                    return {};
+                }
+            };
+            const markResumeSent = (key) => {
+                const rec = sentResumeRecord();
+                rec[key] = Date.now();
+                const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+                Object.keys(rec).forEach(k => { if (!(rec[k] > cutoff)) delete rec[k]; });
+                try {
+                    localStorage.setItem(SENT_RESUME_KEY, JSON.stringify(rec));
+                } catch (e) { /* 忽略存储失败 */ }
+            };
+
+            // 等简历弹窗真正渲染出来：Boss 的弹窗是异步出现的，实测 800ms 时还读不到
+            const waitResumePanel = async (timeout = 12000) => {
+                const deadline = Date.now() + timeout;
+                while (Date.now() < deadline) {
+                    if (collectResumeItems().length > 0) return true;
+                    // 后台标签里尺寸为 0，用全量面板的文本判断弹窗是否已经出现
+                    if (allPanels().some((p) => ((p.textContent || '').indexOf('简历') !== -1))) return true;
+                    const text = panelText();
+                    if (text && text.indexOf('简历') !== -1) return true;
+                    await tools.asyncSleep(250);
+                }
+                return false;
+            };
+
+            // 重新拉一次配置（页面打开时后端没起、后来才启动的场景）
+            const reloadConfig = async () => {
+                const cfg = await new Api().getClientConfig().catch(() => null);
+                if (cfg && cfg.frontend) {
+                    applyFrontendOptions(cfg.frontend, (m) => { if (logger) logger.add(m); });
+                    return true;
+                }
+                return false;
+            };
+
+            const waitResumeSendBtn = async (timeout = 4000) => {
+                const deadline = Date.now() + timeout;
+                while (Date.now() < deadline) {
+                    const btn = findResumeSendBtn();
+                    if (btn) return btn;
+                    await tools.asyncSleep(200);
+                }
+                return null;
+            };
+
+            /**
+             * 发送简历
+             * @returns {{sent: boolean, reason?: string, mode?: string, selectedResumeName?: string, matchedBy?: string}}
+             */
+            const sendResume = async (resumeIndex = OPTIONS.resumeIndex, options = {}) => {
+                const dryRun = !!options.dryRun;
+                // 详情页会抢焦点，聊天页可能在后台；弹窗在后台标签里可能量出 0 尺寸
+                try { window.focus(); } catch (e) { /* 被浏览器忽略也没关系 */ }
+                const cfg = resumeConfig();
+                const sendBtn = await waitResumeSendBtn();
+                if (!sendBtn) {
+                    const snap = describeResumeUi();
+                    logger.add('简历按钮没找到，现场: ' + snap);
+                    return { sent: false, reason: `未找到“发送简历”按钮（${snap}）`, mode: 'no_button' };
+                }
                 sendBtn.click();
 
-                // 可能是弹一个小窗
-                const smallDialog = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.RESUMEMODAL).catch(() => null);
-                if (smallDialog) {
-                    smallDialog.querySelector(SELECTORS.ZHIPIN.CHAT.RESUMEMODALCONFIRM).click();
-                    await sendMsg('已发送，请查收');
+                const panelReady = await waitResumePanel();
+                if (!panelReady) {
+                    logger.add('等了 8 秒还没看到简历弹窗，可能没点开或结构变了');
+                }
+                await tools.asyncSleep(300);
+
+                if (cfg.preferAttachment) {
+                    const switched = await switchToAttachmentTab();
+                    logger.add(switched ? '已切换到附件简历页签' : '未发现附件简历页签，按当前面板内容继续');
+                }
+
+                let items = collectResumeItems();
+                for (let i = 0; i < 12 && !items.length; i++) {
+                    await tools.asyncSleep(500);
+                    items = collectResumeItems();
+                }
+                if (!items.length) {
+                    // 聊天页可能在后台（详情页抢了焦点），弹窗量出 0 尺寸 → 退回不看可见性
+                    items = collectResumeItems(false);
+                    if (items.length) {
+                        logger.add(`按可见性收不到简历项，退回全量收集到 ${items.length} 项（页面可能在后台）`);
+                    }
+                }
+                logger.add('简历列表: ' + (items.map((it, i) => `${i}:${it.text.slice(0, 26)}`).join(' | ') || '(未识别到简历列表)'));
+                logger.add('目标简历关键字: ' + (cfg.keywords.join(' / ') || '(未配置)'));
+                if (!items.length) {
+                    logger.add('弹窗结构: ' + dumpPanelStructure());
+                }
+
+                const pool = items.filter(it => !cfg.exclude.some(k => it.text.indexOf(k) !== -1));
+                let picked = null;
+                let matchedBy = '';
+
+                // 1) 按关键字匹配（name 优先）
+                for (const kw of cfg.keywords) {
+                    const hit = pool.find(it => it.text.indexOf(kw) !== -1);
+                    if (hit) {
+                        picked = hit;
+                        matchedBy = 'name:' + kw;
+                        break;
+                    }
+                }
+
+                if (picked) {
+                    logger.add(`选择简历: ${picked.text.slice(0, 30)} (${matchedBy})`);
+                    picked.el.click();
+                    await tools.asyncSleep(350);
+                } else {
+                    // 2) 面板里默认选中的就是目标简历 → 直接确认
+                    const text = panelText();
+                    const hitKeyword = cfg.keywords.find(kw => text.indexOf(kw) !== -1);
+                    const attachEvidence = /\.(pdf|docx?)\b/i.test(text) || text.indexOf('附件') !== -1;
+                    if (hitKeyword && (!cfg.preferAttachment || attachEvidence)) {
+                        matchedBy = 'panel:' + hitKeyword;
+                        logger.add(`简历面板默认已包含目标简历（${hitKeyword}），直接确认`);
+                    } else if (cfg.strict) {
+                        // 3) 严格模式：宁可不发，也不发错简历
+                        const snap = describeResumeUi();
+                        const reason = cfg.keywords.length
+                            ? `未找到指定简历（关键字: ${cfg.keywords.join(' / ')}）`
+                            : '未配置 resume.name / resume.match，且未识别到简历列表';
+                        logger.add(reason + '，已放弃本次发送。现场: ' + snap);
+                        await logAction({
+                            action: 'resume_skip_detail',
+                            scene: 'chat',
+                            reason,
+                            resumeItems: items.map((it) => it.text.slice(0, 40)),
+                            panelText: panelText().slice(0, 200),
+                            panelStructure: snap.slice(0, 600),
+                        });
+                        closeResumePanel();
+                        return {
+                            sent: false,
+                            reason,
+                            mode: 'skipped',
+                            panelSnapshot: snap,
+                            items: items.map((it) => it.text.slice(0, 40)),
+                        };
+                    } else {
+                        // 4) 非严格模式：退回序号兜底（老行为）
+                        picked = items[resumeIndex] || items[0] || null;
+                        matchedBy = picked ? 'index:' + items.indexOf(picked) : 'none';
+                        logger.add(`未匹配到指定简历，按兜底策略选择: ${picked ? picked.text.slice(0, 26) : '(无)'} (${matchedBy})`);
+                        if (picked) {
+                            picked.el.click();
+                            await tools.asyncSleep(350);
+                        }
+                    }
+                }
+
+                // 试运行：只打开弹窗、列出候选、不点确认，绝不真的发出去
+                if (dryRun) {
+                    const target = picked ? picked.text.slice(0, 40) : (panelText().slice(0, 60) || '(未识别)');
+                    logger.add(`[试运行] 弹窗内容: ${panelText().slice(0, 120) || '(空)'}`);
+                    const drySnap = dumpPanelStructure();
+                    logger.add('[试运行] 结构: ' + drySnap);
+                    await logAction({
+                        action: 'resume_dryrun',
+                        scene: 'chat',
+                        matchedBy: matchedBy || 'none',
+                        target: target.slice(0, 60),
+                        resumeItems: items.map((it) => it.text.slice(0, 40)),
+                        panelText: panelText().slice(0, 200),
+                        panelStructure: drySnap.slice(0, 600),
+                    });
+                    logger.add(`[试运行] 本应发送: ${target}（${matchedBy || 'panel_default'}）`);
+                    closeResumePanel();
                     return {
-                        mode: 'small_dialog',
-                        selectedResumeIndex: resumeIndex,
+                        sent: false,
+                        dryRun: true,
+                        selectedResumeName: target,
+                        matchedBy: matchedBy || 'panel_default',
+                        reason: '试运行模式，未真正发送',
                     };
                 }
 
-                // 弹出大窗让选择
-                const resumeCtn = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.RESUMELIST);
-                const confirm = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.RESUMESENDCONFIRM);
-                const resumes = resumeCtn.querySelectorAll(SELECTORS.ZHIPIN.CHAT.RESUMELISTITEM);
-                const fallbackIndex = resumes[resumeIndex] ? resumeIndex : (resumes[OPTIONS.resumeIndex] ? OPTIONS.resumeIndex : 0);
-                const resume = resumes[fallbackIndex];
-                await tools.asyncSleep(300);
-                resume.click();
-                await tools.asyncSleep(300);
+                const confirm = findConfirmBtn();
+                if (!confirm) {
+                    const snap = describeResumeUi();
+                    logger.add('没找到确认按钮，现场: ' + snap);
+                    return { sent: false, reason: `未找到简历发送确认按钮（${snap}）`, mode: 'no_confirm' };
+                }
                 confirm.click();
-                await sendMsg('已发送，请查收');
+                await tools.asyncSleep(600);
+                const verified = await verifyResumeSent(4000);
+                if (!verified) {
+                    logger.add('已点击发送，但没检测到简历回执，请人工确认是否发出');
+                }
+
+                if (cfg.followUpText) {
+                    await sendMsg(cfg.followUpText).catch(() => null);
+                }
+
                 return {
-                    mode: 'resume_list',
-                    selectedResumeIndex: fallbackIndex,
+                    sent: true,
+                    verified,
+                    mode: items.length ? 'resume_list' : 'panel_default',
+                    selectedResumeIndex: picked ? items.indexOf(picked) : -1,
+                    selectedResumeName: picked ? picked.text.slice(0, 60) : (panelText().slice(0, 60) || null),
+                    matchedBy: matchedBy || 'panel_default',
                 };
             };
 
@@ -1529,20 +2408,14 @@
             const chat = async () => {
                 // api
                 const api = new Api();
-                const logAction = async (payload) => {
-                    try {
-                        await api.logAction(payload);
-                    } catch (e) {
-                        console.log('logAction failed', e);
-                    }
-                };
                 // 开始广播
                 startBroadcast(this.targets.chat);
                 // 获取默认自我介绍（兜底）
-                const defaultIntroduce = (await this.broadcast.sendAndReceive(
-                    this.targets.search,
-                    this.bcTypes.INTRODUCE,
-                )).introduce;
+                // 搜索页没开时别干等 30 秒，8 秒就放弃（没有招呼语就不在聊天页补发）
+                const defaultIntroduce = await this.broadcast
+                    .sendAndReceive(this.targets.search, this.bcTypes.INTRODUCE, null, 8000)
+                    .then((res) => (res && res.introduce) || '')
+                    .catch(() => '');
                 // 心跳
                 let count = 0;
                 const loop = async () => {
@@ -1582,6 +2455,7 @@
                             // 获取联系人信息
                             const name = ls.querySelector(SELECTORS.ZHIPIN.CHAT.USERNAME);
                             const company = name.nextElementSibling.innerText;
+                            const contactKey = `${name.innerText}|${company}`;
                             divider();
                             status(`[${company} - ${name.innerText}] 发来一条新消息`);
                             // 进入聊天界面
@@ -1599,6 +2473,8 @@
                                 const jobInfo = await this.broadcast.receive(this.targets.detail, this.bcTypes.GET_JOB_INFO);
                                 // 获取职位匹配度
                                 status(`开始计算职位 [${jobInfo.title}] 的匹配度`);
+                                // 详情页会自己 window.close()，稍等让焦点回到聊天页再操作简历弹窗
+                                await tools.asyncSleep(600);
                                 const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
                                 status(`匹配度: ${decision.score} | 简历索引: ${decision.resumeIndex}`);
                                 await logAction({
@@ -1610,7 +2486,7 @@
                                     resumeIndex: decision.resumeIndex,
                                 });
                                 // 如果分数达到阈值并且未聊过天，打个招呼
-                                if (decision.score >= OPTIONS.thread && !chatInfo.msgs.length) {
+                                if (defaultIntroduce && decision.score >= OPTIONS.thread && !chatInfo.msgs.length) {
                                     status(`正在给职位 [${jobInfo.title}] 发送打招呼消息`);
                                     try {
                                         await sendMsg(decision.introduce || defaultIntroduce);
@@ -1649,25 +2525,62 @@
                             }
                             let isChat = true;
                             // 只要对方发来新消息且还没发过简历，就直接发送简历，不再调用大模型聊天
-                            if (!chatInfo.resumeSended) {
+                            const sentBefore = !!sentResumeRecord()[contactKey];
+                            if (!chatInfo.resumeSended && !sentBefore) {
                                 isChat = false;
+                                if (failedResumeContacts.has(contactKey)) {
+                                    status('该联系人上次发简历没成功，本次跳过（避免反复弹窗），重启脚本可重试');
+                                    continue;
+                                }
                                 localStorage.setItem(this.targets.chat, new Date().getTime());
                                 chatInfo.jobEl.click();
                                 status(`正在获取职位详情（用于确定简历）`);
-                                const jobInfo = await this.broadcast.receive(this.targets.detail, this.bcTypes.GET_JOB_INFO);
+                                const jobInfo = await this.broadcast.receive(
+                                    this.targets.detail,
+                                    this.bcTypes.GET_JOB_INFO,
+                                    OPTIONS.detailTimeout + 5000
+                                ).catch(() => null);
+                                if (!jobInfo || jobInfo.error || !jobInfo.title || !jobInfo.detail) {
+                                    const why = jobInfo?.error || jobInfo?.skipReason || '详情回传超时';
+                                    status(`未拿到职位详情（${why}），本次不自动发简历`);
+                                    await logAction({
+                                        action: 'resume_skip_no_jobinfo',
+                                        scene: 'chat',
+                                        reason: why,
+                                    });
+                                    continue;
+                                }
+                                // 详情页会自己 window.close()，稍等让焦点回到聊天页再操作简历弹窗
+                                await tools.asyncSleep(600);
                                 const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
-                                status(`检测到新消息，直接发送简历（简历索引 ${decision.resumeIndex}）`);
+                                status(`检测到新消息，正在发送指定简历`);
                                 const resumeResult = await sendResume(decision.resumeIndex);
+                                if (!resumeResult.sent) failedResumeContacts.add(contactKey);
                                 await logAction({
-                                    action: 'resume_sent',
+                                    action: resumeResult.sent ? 'resume_sent' : 'resume_skip',
                                     scene: 'chat',
                                     title: jobInfo.title,
                                     salary: jobInfo.salary,
                                     requestedResumeIndex: decision.resumeIndex,
-                                    selectedResumeIndex: resumeResult?.selectedResumeIndex ?? decision.resumeIndex,
+                                    selectedResumeIndex: resumeResult?.selectedResumeIndex ?? null,
+                                    selectedResumeName: resumeResult?.selectedResumeName || null,
+                                    resumeMatchedBy: resumeResult?.matchedBy || null,
                                     sendMode: resumeResult?.mode || 'unknown',
+                                    verified: resumeResult?.verified ?? null,
+                                    reason: resumeResult?.reason || null,
+                                    resumeItems: resumeResult?.items || null,
+                                    panelSnapshot: resumeResult?.panelSnapshot || null,
                                 });
-                                status('发送成功');
+                                if (resumeResult.sent) {
+                                    markResumeSent(contactKey);
+                                    if (resumeResult.verified === false) {
+                                        status('简历已发送，但没检测到回执，请人工确认一次');
+                                    } else {
+                                        status('简历已发送');
+                                    }
+                                } else {
+                                    status(`简历未发送：${resumeResult.reason}`);
+                                }
                             }
                             // 是否需要作品集（当前关闭自动发送，仅保留原入口）
                             if (chatInfo.needWorks && !chatInfo.worksSended) {
@@ -1694,8 +2607,41 @@
                 await once();
             };
 
+            // 手动测试入口：在 Boss 聊天页点油猴图标，菜单里选“测试发送指定简历”
+            if (typeof GM_registerMenuCommand === 'function') {
+                // 试运行：只打开弹窗看有哪些简历、会选中哪个，不点确认，不会真发
+                GM_registerMenuCommand('① 检查简历弹窗（不发）', async () => {
+                    // sendResume 内部会写 logger，这里必须先确保它存在
+                    if (!logger) logger = new Logger();
+                    logger.add('=== 试运行：检查简历弹窗 ===');
+                    await reloadConfig();
+                    const result = await sendResume(OPTIONS.resumeIndex, { dryRun: true });
+                    logger.add(result.dryRun
+                        ? `✅ 链路正常，本应发送：${result.selectedResumeName}（${result.matchedBy}）`
+                        : `⚠️ 链路有问题：${result.reason}`);
+                });
+                // 真实发送：会真的把简历发给当前会话
+                GM_registerMenuCommand('② 真的给当前会话发简历', async () => {
+                    if (!logger) logger = new Logger();
+                    logger.add('=== 真实发送简历 ===');
+                    await reloadConfig();
+                    const result = await sendResume();
+                    logger.add(result.sent
+                        ? `✅ 已发送：${result.selectedResumeName || '(未识别名称)'}（${result.confirmed || result.mode}）`
+                        : `❌ 未发送：${result.reason}`);
+                });
+            }
+
             // 主函数
             const main = async () => {
+                // 聊天页自己也要拉一次配置：resume.match 只存在后端，
+                // 不拉的话 OPTIONS.resume 是空数组，严格模式永远“未配置”而放弃发送。
+                const bootLogs = [];
+                const bootConfig = await new Api().getClientConfig().catch(() => null);
+                if (bootConfig && bootConfig.frontend) {
+                    applyFrontendOptions(bootConfig.frontend, (m) => bootLogs.push(m));
+                }
+
                 // 判断来源
                 const now = new Date().getTime();
                 const isGreet = now - tools.getTimestamp(this.targets.chatGreet) < OPTIONS.timestampTimeout && window.name === this.targets.chatGreet;
@@ -1705,20 +2651,32 @@
                     sayHi();
                 }
                 else if (isChat) {
+                    // 这次是“中途轮询”还是“轮次结束处理”
+                    const isPoll = localStorage.getItem(CHAT_MODE_KEY) === CHAT_MODE_POLL;
+                    localStorage.removeItem(CHAT_MODE_KEY);
                     // 日志
                     logger = new Logger();
                     logger.runBtn.remove();
                     logger.clearBtn.remove();
+                    bootLogs.forEach((m) => logger.add(m));
                     // 等待加载
                     await tools.asyncSleep(3000);
                     chat()
                         .then(async () => {
                             status('消息处理完毕');
-                            await this.broadcast.send(this.targets.search, this.bcTypes.RUN, true);
+                            await this.broadcast.send(
+                                this.targets.search,
+                                this.bcTypes.RUN,
+                                isPoll ? { poll: true } : true
+                            );
                         })
                         .catch(async () => {
                             status('聊天程序运行出错');
-                            await this.broadcast.send(this.targets.search, this.bcTypes.RUN, false);
+                            await this.broadcast.send(
+                                this.targets.search,
+                                this.bcTypes.RUN,
+                                isPoll ? { poll: true, error: true } : false
+                            );
                         }).finally(() => {
                             this.broadcast.destroy();
                         });

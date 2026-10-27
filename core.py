@@ -80,11 +80,19 @@ def __normalize_text(text: str) -> str:
     return text.lower()
 
 
+def __compact_text(text: str) -> str:
+    """去掉空白与常见分隔符，避免 “AI Agent 开发 / AI-Agent开发 / AI Agent（开发）” 匹配不上。"""
+    # 注意：只去空白和结构性分隔符，保留 + / - # 等有语义的字符（c++、a/b、c#）
+    return re.sub(r'[\s·•—–_|\\（）()\[\]【】{}<>《》,，.。;；:：!！?？"“”\'‘’*]+', '', text.lower())
+
+
 def __find_matches(text: str, keyword_scores: dict[str, int]) -> list[tuple[str, int]]:
     normalized = __normalize_text(text)
+    compact = __compact_text(text)
     matches = []
     for keyword, score in keyword_scores.items():
-        if keyword.lower() in normalized:
+        key = keyword.lower()
+        if key in normalized or __compact_text(key) in compact:
             matches.append((keyword, score))
     return matches
 
@@ -114,6 +122,36 @@ def evaluateJobMatch(job: str):
             'detail_support_matches': [],
             'detail_negative_matches': [],
             'reason': '岗位名称命中强负向关键词',
+        }
+
+    # 职能门控：先把“不是研发岗”的标题挡掉。
+    # 否则 “GTM/市场/售前/产品” 这类岗位只要标题里带 AI Agent，就能靠正向词拿满分。
+    # 例外短语先剔除，避免 “一级市场/二级市场” 这种金融术语被当成营销岗。
+    gate_title = title
+    for phrase in Config.title_nondev_exceptions:
+        gate_title = gate_title.replace(phrase, '')
+    title_nondev_matches = __find_matches(gate_title, Config.title_nondev_keywords)
+    if title_nondev_matches:
+        return {
+            'title': title,
+            'detail': detail,
+            'matched_field': 'title_nondev',
+            'keyword': title_nondev_matches[0][0],
+            'score': 0,
+            'blocked': True,
+            'title_score': 0,
+            'detail_score': 0,
+            'penalty_score': 0,
+            'title_penalty_score': 0,
+            'combo_score': 0,
+            'final_score': 0,
+            'title_match_level': 'nondev',
+            'title_matches': [keyword for keyword, _ in title_nondev_matches],
+            'title_penalty_matches': [],
+            'detail_infra_matches': [],
+            'detail_support_matches': [],
+            'detail_negative_matches': [],
+            'reason': f'岗位职能不是研发（命中「{title_nondev_matches[0][0]}」）',
         }
 
     title_strong_matches = __find_matches(title, Config.title_strong_keywords)
@@ -156,8 +194,16 @@ def evaluateJobMatch(job: str):
         combo_score += 10
 
     raw_score = title_score + detail_score + combo_score - title_penalty_score - penalty_score
+    # 标题必须命中“目标方向词”。泛化词（web开发/python/后端…）即使 JD 里有 Agent 技术栈，
+    # 也不该直接冲到阈值以上，否则会一路投到普通后端岗。
+    min_title_score = int(Config.scoring.get('min_title_score', 86) or 86)
     if title_match_level == 'none':
         raw_score = min(raw_score, 55)
+    elif title_score < min_title_score:
+        raw_score = min(raw_score, 80)
+    if not detail_infra_matches and not detail_support_matches:
+        # 标题党：标题命中 Agent 关键词，但 JD 里一点技术要求都没有（典型是市场/运营岗把 Agent 写进标题）
+        raw_score = min(raw_score, 80)
     final_score = max(0, min(100, raw_score))
 
     if title_match_level in ['strong', 'medium']:
