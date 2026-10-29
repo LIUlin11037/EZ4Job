@@ -278,6 +278,19 @@
         say(`简历策略：指定关键字 [${resumeKeywords}]，严格模式 ${OPTIONS.resume.strict !== false ? '开' : '关'}`);
     }
 
+    // 风控 / 验证码 / 访问受限页（搜索页与详情页共用，所以放在模块作用域）
+    function detectBlockPage() {
+        const title = document.title || '';
+        if (/安全验证|验证码|访问异常|操作频繁|访问受限|无法访问/.test(title)) return title.trim();
+        if (document.querySelector('#captcha, .captcha, .verify-wrap, .boss-verify')) return '验证码页面';
+        // Boss 的「访问受限」页标题仍然是「BOSS直聘」，只能看正文；
+        // 该页正文极短（就一句“抱歉，您暂时无法访问此页面”），用 textContent 足够且不触发重排
+        const raw = (document.body && document.body.textContent) || '';
+        const head = raw.replace(/\s+/g, '').slice(0, 200);
+        if (/访问受限|暂时无法访问|访问异常|操作过于频繁|请求过于频繁|稍后再访问/.test(head)) return '访问受限页';
+        return '';
+    }
+
     class WebBroadcastError extends Error {
         constructor(code, message) {
             super(message);
@@ -1034,6 +1047,7 @@
 
             let greetFailStreak = 0; // 连续被平台拒绝的次数
             let loopErrorStreak = 0; // loop 连续异常次数
+            let blockStreak = 0; // 连续被风控/访问受限挡住的次数
             let pendingGreetTimer = null;
             let pendingGreetTitle = '';
             let pendingGreetDecision = null;
@@ -1335,7 +1349,16 @@
                     logger.add(`正在获取职位详情`);
                     const jobInfo = await getJobInfo(href);
                     if (jobInfo.skip) {
-                        logger.add(`职位跳过: ${jobInfo.skipReason}`);
+                        const skipText = String(jobInfo.skipReason || '');
+                        // 被风控挡住不是“这个岗位不好”，继续往下点只会让封禁更重，必须停
+                        const blocked = /风控|访问受限|验证码|访问异常|操作频繁/.test(skipText);
+                        if (blocked) {
+                            blockStreak += 1;
+                            logger.add(`⚠ 详情页疑似被风控拦截（连续 ${blockStreak} 次）：${skipText}`);
+                        } else {
+                            blockStreak = 0;
+                        }
+                        logger.add(`职位跳过: ${skipText}`);
                         await logAction({
                             action: 'job_skip',
                             scene: 'search',
@@ -1344,9 +1367,18 @@
                             salary: jobInfo.salary || null,
                             detail: jobInfo.detail || null,
                             reason: jobInfo.skipReason,
+                            blocked,
                         });
+                        if (blocked && blockStreak >= 3) {
+                            return stopProgram(
+                                `连续 ${blockStreak} 个岗位被风控拦截，已自动停止。` +
+                                '建议至少等 30 分钟再继续；仍被拦就换网络（切手机热点）、重启浏览器，并把投递速度调慢'
+                            );
+                        }
+                        if (blocked) await tools.asyncSleep(5000);
                         return loop();
                     }
+                    blockStreak = 0;
                     rememberProcessed(href);
                     // 如果聊过，下一个
                     if (jobInfo.talked) {
@@ -1533,6 +1565,15 @@
                 window.scrollTo({ top: 0, left: 0, behavior: 'smooth' });
                 await tools.asyncSleep(600);
                 await search(keyword);
+                // 搜索页本身也可能被风控（“访问受限”），这时继续往下滑只会白白加深封禁
+                await tools.asyncSleep(1200);
+                const blockedNow = detectBlockPage();
+                if (blockedNow) {
+                    return stopProgram(
+                        `搜索页被风控拦截（${blockedNow}），已自动停止。` +
+                        '建议至少等 30 分钟再继续；仍被拦就换网络（切手机热点）、重启浏览器再试'
+                    );
+                }
                 logger.add(`第 ${currentRound} 轮已完成搜索（关键词：${keyword}），请在 ${(OPTIONS.manualFilterWaitMs / 1000).toFixed(0)} 秒内手动选择地区、薪资等筛选条件`);
                 await tools.asyncSleep(OPTIONS.manualFilterWaitMs);
                 await preloadJobs();
@@ -1613,14 +1654,6 @@
             startBroadcast();
 
             const sleep = tools.asyncSleep;
-
-            // 风控 / 验证码 / 岗位下线页
-            const detectBlockPage = () => {
-                const title = document.title || '';
-                if (/安全验证|验证码|访问异常|操作频繁|登录/.test(title)) return title.trim();
-                if (document.querySelector('#captcha, .captcha, .verify-wrap, .boss-verify')) return '验证码页面';
-                return '';
-            };
 
             // 等关键 DOM 就绪：页面没渲染完就读取，会直接抛错并让搜索页干等超时
             const waitReady = async () => {
