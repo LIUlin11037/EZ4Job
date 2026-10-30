@@ -768,6 +768,8 @@
                 detail: "__zhipin_detail",
                 chat: "__zhipin_chat",
                 chatGreet: "__zhipin_chat_greet",
+                // 专门用来点“立即沟通 → 继续沟通”的确认页（Boss 沟通量接近上限时会拦）
+                confirm: "__zhipin_detail_confirm",
             };
             // 广播类型
             this.bcTypes = {
@@ -780,6 +782,8 @@
                 // 聊天页和职位详情页
                 GET_JOB_INFO: 'get-job-info',
                 SAY_HI: 'say-hi',
+                // 搜索页 ↔ 确认页
+                CONFIRM_CHAT: 'confirm-chat',
             };
             // 白名单
             this.whiteList = WHITELIST.zhipin;
@@ -1051,6 +1055,8 @@
             let greetFailStreak = 0; // 连续被平台拒绝的次数
             let loopErrorStreak = 0; // loop 连续异常次数
             let blockStreak = 0; // 连续被风控/访问受限挡住的次数
+            // 一旦 Boss 要求过“继续沟通”确认，后面每个岗位都会拦，直接走 UI 点击，不再白跑两次 fetch
+            let uiConfirmMode = false;
             let pendingGreetTimer = null;
             let pendingGreetTitle = '';
             let pendingGreetDecision = null;
@@ -1220,7 +1226,31 @@
                 };
             };
 
-            const addToChatList = (url) => {
+            // 开一个确认页，让详情页去点「立即沟通 → 继续沟通」，回来告诉我们成没成
+            const confirmChatViaUi = async (href) => {
+                if (!href) return { ok: false, reason: '缺少岗位链接' };
+                try {
+                    this.broadcast.clearInbox(this.targets.confirm, this.bcTypes.CONFIRM_CHAT);
+                } catch (e) { /* 忽略 */ }
+                const win = tools.openTabNSetTimestamp(href, this.targets.confirm);
+                if (!win) return { ok: false, reason: '确认页被浏览器拦截（请允许 zhipin.com 弹窗）' };
+                const res = await this.broadcast
+                    .receive(this.targets.confirm, this.bcTypes.CONFIRM_CHAT, 30000)
+                    .catch(() => null);
+                if (!res) return { ok: false, reason: '确认页 30s 未回传结果' };
+                return res;
+            };
+
+            const addToChatList = (url, ctx = {}) => {
+                if (uiConfirmMode) {
+                    // 已知会被拦，直接去页面点确认，省掉两次注定失败的请求
+                    logger.add('已进入确认模式，直接在页面点「立即沟通 → 继续沟通」');
+                    return confirmChatViaUi(ctx.href).then((ui) => {
+                        if (ui && ui.ok) return { code: 0, uiConfirmed: true };
+                        uiConfirmMode = false;
+                        throw new Error(`biz_fail:页面确认失败 ${(ui && ui.reason) || '未知原因'}`);
+                    });
+                }
                 const readOnce = () => new Promise((resolve, reject) => {
                     // fetch 本身没有超时，网关卡住时会永远不 resolve，整个投递循环就停在那里
                     const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
@@ -1255,12 +1285,27 @@
                 });
 
                 return readOnce().catch(async (err) => {
-                    if (!parseGreetRemind(String((err && err.message) || err))) throw err;
-                    // 确认类提示：等一会儿再发一次，很多时候第二次就放行了
-                    const left = parseGreetRemind(String((err && err.message) || err)).remaining;
+                    const first = parseGreetRemind(String((err && err.message) || err));
+                    if (!first) throw err;
+                    const left = first.remaining;
                     logger.add(`Boss 提示${left !== null ? `还剩 ${left} 次沟通机会` : '需要确认沟通额度'}，1.5 秒后重试一次`);
                     await tools.asyncSleep(1500);
-                    return readOnce();
+                    try {
+                        return await readOnce();
+                    } catch (err2) {
+                        const second = parseGreetRemind(String((err2 && err2.message) || err2));
+                        if (!second) throw err2;
+                        // 重试还是被拦：Boss 要的是页面上真人点一下确认，只能去详情页做 UI 点击
+                        logger.add('自动重试仍被拦，改为在详情页点「立即沟通」并确认');
+                        const ui = await confirmChatViaUi(ctx.href);
+                        if (ui && ui.ok) {
+                            logger.add(`页面确认成功：${ui.reason}（后续直接走页面确认，不再试 fetch）`);
+                            uiConfirmMode = true;
+                            return { code: 0, uiConfirmed: true, remaining: second.remaining };
+                        }
+                        logger.add(`页面确认失败：${(ui && ui.reason) || '未知原因'}`);
+                        throw err2;
+                    }
                 });
             };
 
@@ -1449,7 +1494,7 @@
                             score: decision.score,
                         });
                         // 判断是否有提醒返回
-                        addToChatList(jobInfo.addUrl).then(async () => {
+                        addToChatList(jobInfo.addUrl, { href: jobInfo.href || href, title: jobInfo.title }).then(async () => {
                             // 只有平台真的建立了沟通才计数，失败不占当日额度
                             greetCount += 1;
                             dailyGreetCount = bumpDailyCount();
@@ -1507,10 +1552,10 @@
                                     stopProgram(`按 Boss 计数今日已沟通 ${dailyGreetCount} 个，达到 maxGreetsPerDay=${dailyLimit}`);
                                     return;
                                 }
-                                logger.add(`Boss 提示今日沟通较多（${left}），重试后仍未放行`);
+                                logger.add(`Boss 提示今日沟通较多（${left}），自动确认也没能放行`);
                                 stopProgram(
-                                    `Boss 要求确认沟通额度（${left}）。` +
-                                    '这不是拒绝——请在 Boss 页面手动点一次「立即沟通」，在弹窗里点「继续沟通」，' +
+                                    `Boss 要求确认沟通额度（${left}）。脚本已在详情页尝试点「立即沟通 → 继续沟通」但没成功，` +
+                                    '需要你手动处理一次：在 Boss 页面点「立即沟通」，弹窗里点「继续沟通」，' +
                                     '然后点面板上的「继续」接着跑'
                                 );
                                 return;
@@ -1713,9 +1758,11 @@
 
         // 详情页
         async __detail() {
+            // 同一个详情页有两种用途：正常读岗位信息，或替搜索页点“立即沟通 → 继续沟通”
+            const isConfirmMode = window.name === this.targets.confirm;
             // 注册广播
             const startBroadcast = () => {
-                this.__broadcast(this.targets.detail);
+                this.__broadcast(isConfirmMode ? this.targets.confirm : this.targets.detail);
             };
             startBroadcast();
 
@@ -1794,8 +1841,91 @@
                 }
             };
 
+            // 替用户点「立即沟通」；如果 Boss 弹出「还剩 N 次沟通机会」的提醒，再点「继续沟通」。
+            // 这个提醒必须真人在页面上点一次，直接 fetch add.json 是绕不过去的。
+            const confirmStartChat = async () => {
+                const textOf = (el) => ((el && el.innerText) || '').trim();
+                const deadline = Date.now() + 10000;
+                let btn = null;
+                while (Date.now() < deadline) {
+                    btn = document.querySelector(SELECTORS.ZHIPIN.DETAIL.STARTCHAT);
+                    if (btn) break;
+                    const blocked = detectBlockPage();
+                    if (blocked) return { ok: false, reason: `详情页被风控拦截（${blocked}）` };
+                    await sleep(200);
+                }
+                if (!btn) return { ok: false, reason: '未找到沟通按钮' };
+
+                const startText = textOf(btn);
+                if (startText.indexOf('继续沟通') !== -1) {
+                    return { ok: true, already: true, reason: '按钮已是「继续沟通」，沟通已建立' };
+                }
+                if (startText.indexOf('立即沟通') === -1) {
+                    return { ok: false, reason: `按钮为 [${startText || '未知'}]，不是可沟通岗位` };
+                }
+
+                btn.click();
+                await sleep(700);
+
+                const wanted = ['继续沟通', '继续', '确定', '确认'];
+                const pickIn = (root) => {
+                    const nodes = Array.from(root.querySelectorAll('a, button, span, div'));
+                    for (const el of nodes) {
+                        if (el === btn || btn.contains(el) || el.contains(btn)) continue;
+                        if (!wanted.includes(textOf(el))) continue;
+                        if (!el.getClientRects().length) continue;
+                        return el;
+                    }
+                    return null;
+                };
+                // 优先在弹窗容器里找，避免误点页面上的其他同名文字
+                const dialogSel = '.dialog-wrap, .dialog-container, .boss-dialog, .boss-popup, [class*="dialog"], [class*="popup"], [class*="modal"]';
+                const findConfirmBtn = () => {
+                    for (const root of Array.from(document.querySelectorAll(dialogSel))) {
+                        const hit = pickIn(root);
+                        if (hit) return hit;
+                    }
+                    return pickIn(document);
+                };
+
+                let confirmBtn = null;
+                const dlgDeadline = Date.now() + 8000;
+                while (Date.now() < dlgDeadline) {
+                    confirmBtn = findConfirmBtn();
+                    if (confirmBtn) break;
+                    if (textOf(btn).indexOf('继续沟通') !== -1) {
+                        return { ok: true, reason: '没有弹窗，按钮已变为「继续沟通」' };
+                    }
+                    await sleep(200);
+                }
+                if (!confirmBtn) return { ok: false, reason: '点了「立即沟通」，但没等到确认弹窗' };
+
+                const confirmText = textOf(confirmBtn);
+                confirmBtn.click();
+                await sleep(1200);
+
+                const doneDeadline = Date.now() + 8000;
+                while (Date.now() < doneDeadline) {
+                    if (textOf(btn).indexOf('继续沟通') !== -1) {
+                        return { ok: true, reason: `已点「${confirmText}」，沟通建立` };
+                    }
+                    if (location.pathname.indexOf('/web/geek/chat') === 0) {
+                        return { ok: true, reason: '已跳转到聊天页' };
+                    }
+                    await sleep(300);
+                }
+                return { ok: false, reason: `点了「${confirmText}」，但按钮状态没变化` };
+            };
+
             // 主函数：先等页面就绪，再把结果回传；无论成功失败都要回传
             const main = async () => {
+                if (isConfirmMode) {
+                    const res = await confirmStartChat();
+                    await this.broadcast.send(this.targets.search, this.bcTypes.CONFIRM_CHAT, res);
+                    await sleep(200);
+                    try { window.close(); } catch (e) { /* 忽略 */ }
+                    return;
+                }
                 const ready = await waitReady();
                 const jobInfo = ready.ready ? readJobInfo() : { error: ready.error, href: location.href };
 
