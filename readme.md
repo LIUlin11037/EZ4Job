@@ -36,7 +36,7 @@
 
 ## 适合什么岗位方向
 
-仓库内置的词表和默认配置，是针对 **AI 应用 / Agent 开发**方向调的：
+仓库内置的词表和默认配置，是**两条线并行**调的：**Agent / AI 应用开发** + **Java 后端 / 全栈开发**。
 
 | 会投 | 不投（命中直接 0 分） |
 |---|---|
@@ -44,7 +44,11 @@
 | AI 应用开发、大模型应用开发 | 产品经理、项目经理、产品运营 |
 | RAG / LangGraph / MCP / 工作流 | 市场、销售、售前、解决方案、交付 |
 | AI Engineer / GenAI Engineer / FDE | 测试、运维、SRE、DevOps、外包驻场 |
-| Java 后端（做平台/中台那种） | C++ / Go / Rust / PHP 技术栈 |
+| Java 后端、Java 全栈、服务端开发 | C++ / Go / Rust / PHP 技术栈 |
+| 全栈开发（Java + 前端） | 纯前端 / Node / JavaScript / TypeScript 全栈 |
+
+两条线的分数是独立算的：Agent 岗靠 JD 里的 Agent/RAG 词拿分，Java 岗靠 Spring/MySQL/Redis 这一桶拿分，
+互不干扰。要只投其中一条，把另一条的词表清空就行。
 
 词表全部可改，见 [`scoring`](#scoring-打分规则)。
 
@@ -353,13 +357,24 @@ timestampTimeout  >  detailTimeout
 
 判定逻辑有几层保险：
 
-1. `role_type` 必须是 `agent_dev` 或 `ai_dev`，`language` 不能是 `other`，否则模型说
-   `apply` 也按不投处理
+1. `role_type` 必须是 `agent_dev` / `ai_dev` / `backend_dev` 之一，`language` 不能是 `other`，
+   否则模型说 `apply` 也按不投处理
 2. **捞回闸门**：规则分不够（标题没有方向词）时，模型要同时满足"标题有 AI 方向词 +
    判到 `agent_dev` + 自评 ≥ 85"才允许抬分。否则"Python 开发""后端开发"这类泛化岗
    会被一路投出去
-3. Java 后端例外：只看 `apply` 和 `language`，不卡 85 分——因为这类岗模型自评分本就不高
+3. Java / Python 后端例外：只看 `apply` 和 `language`，不卡 85 分——因为这类岗模型自评分本就不高
 4. 调用失败（超时 / 429 / 鉴权错）**静默回落到规则分**，不会卡住投递
+
+`role_type` 的取值和含义：
+
+| 值 | 含义 | 是否放行 |
+|---|---|---|
+| `agent_dev` | Agent / 智能体 / 大模型应用开发 | ✅ |
+| `ai_dev` | 其他 AI 应用开发、模型服务化 | ✅ |
+| `backend_dev` | Java 后端 / Java 全栈 / 服务端开发 | ✅ |
+| `algo` | 算法、训练、微调、推理优化 | ❌ |
+| `product` / `marketing` / `ops` / `test` | 非研发职能 | ❌ |
+| `other` | C++/Go/Node/PHP 后端、纯前端、泛化软件开发 | ❌ |
 
 **自检命令：**
 
@@ -396,9 +411,13 @@ score = 标题分 + 正文分 + 组合分 - 标题扣分 - 正文扣分
 | `title_medium_keywords` | — | 标题中等信号，单靠它进不了阈值 |
 | `detail_infra_keywords` | +24 | JD 里的 Agent 技术栈 |
 | `detail_support_keywords` | +12 | JD 里的工程落地能力 |
+| `detail_backend_keywords` | +20 | JD 里的后端技术栈（Spring、MyBatis、MySQL、Redis、微服务…） |
 | `combo_score` | +10 | 标题强命中 + JD 至少 2 个技术词 |
 | `title_penalty_keywords` | −45 | 标题弱负向（资深、高级、前端、27届……） |
 | `detail_negative_keywords` | −36 | JD 负向（C++、算法、微调、值班……） |
+
+> **为什么要单独一个 `detail_backend_keywords`**：Java 岗的 JD 里不会出现 Agent / RAG 词，
+> 只靠 `detail_support` 那 12 分根本撑不到阈值，所以后端技术栈按自己的词表单独给分（上限 20）。
 
 **三层硬拦截**（命中直接 0 分，不投）：
 
@@ -406,6 +425,17 @@ score = 标题分 + 正文分 + 组合分 - 标题扣分 - 正文扣分
 2. `title_nondev_keywords`：**职能门控**——判断"这个岗干不干研发"。
    没有这一层，`GTM 实习生（AI Agent 方向）` 这种岗只要标题带 Agent 就能拿满分
 3. `title_nondev_exceptions`：匹配前先剔除的短语，避免"一级市场/二级市场"被当成营销岗
+
+**JS 技术栈的单独处理**（`core.py`）：
+
+词表里有裸 `java`，而 `java` 是 `javascript` 的前缀，直接子串匹配会把 JS 岗当成 Java 岗。所以：
+
+- 标题里出现 `javascript / typescript / node.js` 时，先剔除这些词再匹配
+- 同时把 `后端开发 / 全栈` 这类**只说明是开发岗、不说明技术栈**的泛化词也去掉
+  （否则 `Node.js后端开发` 靠 `后端开发` 就能拿 88 分）
+- 这类标题连中等信号也不给，避免靠 `java` 拿 40 分
+
+结果：`JavaScript开发工程师` → 0 分，`Node.js后端开发` → 11 分，而 `Java全栈开发（Vue）` → 100 分（不受影响）。
 
 **几处封顶（关键）：**
 

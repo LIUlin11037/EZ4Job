@@ -29,25 +29,27 @@ _SYSTEM_PROMPT = """你是求职投递筛选器，负责把不合适的岗位挡
 {{
   "apply": true 或 false,
   "score": 0-100 的整数（与目标的匹配度）,
-  "role_type": "agent_dev" | "ai_dev" | "algo" | "product" | "marketing" | "ops" | "test" | "other",
+  "role_type": "agent_dev" | "ai_dev" | "backend_dev" | "algo" | "product" | "marketing" | "ops" | "test" | "other",
   "language": "python" | "java" | "both" | "other" | "unclear",
   "reason": "不超过 40 个汉字，说明判断依据"
 }}
 
 "role_type" 必须按岗位真实职能填，不要因为 JD 里出现 AI 字样就往上靠：
 - agent_dev：核心工作就是 Agent / 智能体 / 大模型应用开发（编排、RAG、工具调用、Prompt、评测）
-- ai_dev：其他方向的 AI 应用开发（AI 功能接入、模型服务化）；**Java 技术栈的后端/全栈开发岗也填 ai_dev**
-  （求职者 Java 后端能力完整，这类岗位可以投）
-- 非 Java 技术栈的普通后端/全栈/业务系统开发（C++/Go/Node/PHP）、纯前端 → 一律填 other
-- algo：训练/微调/推理优化/算法研究
-- product / marketing / ops / test：对应职能
-- other：泛化的软件开发、后端、全栈、Java/Python 开发、数据库业务开发
+- ai_dev：其他方向的 AI 应用开发（AI 功能接入、模型服务化、AI 工作流）
+- backend_dev：以 Java 为主（或 Java + 前端）的后端 / 全栈 / 服务端开发，
+  典型技术栈 Spring Boot / Spring Cloud / MyBatis / MySQL / Redis / Kafka / 微服务。
+  求职者 Java 后端能力完整，这类岗 apply=true
+- algo：训练/微调/推理优化/算法研究 → apply 必须 false
+- product / marketing / ops / test：对应职能 → apply 必须 false
+- other：非 Java 技术栈的普通后端/全栈/业务系统开发（C++/Go/Node/PHP）、纯前端、
+  数据库业务开发、泛化软件开发 → apply 必须 false
 
-再强调一遍：标题里没有 AI/大模型/Agent/LLM 这类方向词时——
-- 如果岗位是 **Java 技术栈**的后端开发（Spring Boot/Cloud、MyBatis、MySQL、Redis、Kafka、ES），
-  可以 apply=true，role_type=ai_dev，language=java；
-- 其他语言（C++/Go/Node/PHP）或纯前端、纯业务中台，apply 必须是 false，role_type 填 other。
-"language" 看岗位要求的编程语言，C++/C#/Rust/Go/PHP/前端 一律填 other。
+判断顺序：先判断"这岗位是不是真的写代码做研发"，再判断技术栈是不是 Java 或 Python。
+不是研发职能（产品/运营/销售/售前/交付/测试/运维/实施）→ 直接 false。
+是研发但主语言是 C++/C#/Go/Rust/PHP 或纯前端 → false。
+只有 Java 后端 / Java 全栈 / Python 后端 / Agent 与 AI 应用开发才允许 apply=true。
+"language" 看岗位要求的主要编程语言，C++/C#/Rust/Go/PHP/前端 一律填 other。
 """
 
 
@@ -142,7 +144,7 @@ def _parse_verdict(content: str) -> dict:
     if not isinstance(data, dict) or 'apply' not in data:
         raise ValueError(f'模型返回结构不符合预期: {content[:120]}')
     role = str(data.get('role_type') or 'other').strip().lower()
-    if role not in {'agent_dev', 'ai_dev', 'algo', 'product', 'marketing', 'ops', 'test', 'other'}:
+    if role not in {'agent_dev', 'ai_dev', 'backend_dev', 'algo', 'product', 'marketing', 'ops', 'test', 'other'}:
         role = 'other'
     language = str(data.get('language') or 'unclear').strip().lower()
     if language not in {'python', 'java', 'both', 'other', 'unclear'}:
@@ -257,7 +259,7 @@ def apply_verdict(rule_result: dict, verdict: dict | None, thread: int) -> dict:
         java_backend = (
             allow_java_backend
             and language in {'java', 'both'}
-            and role in {'agent_dev', 'ai_dev'}
+            and role in {'agent_dev', 'ai_dev', 'backend_dev'}
         )
         if java_backend:
             pass
@@ -272,7 +274,7 @@ def apply_verdict(rule_result: dict, verdict: dict | None, thread: int) -> dict:
             reason = f'{reason}｜模型自评分 {model_score} 不足 85，不捞回'
 
     # 双重保险：模型说 apply，但职能/语言与画像不符 → 一律按不投处理
-    if apply_flag and role not in {'agent_dev', 'ai_dev'}:
+    if apply_flag and role not in {'agent_dev', 'ai_dev', 'backend_dev'}:
         apply_flag = False
         reason = f'{reason}（职能是{role}）'
     if apply_flag and language == 'other':

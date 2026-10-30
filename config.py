@@ -46,13 +46,13 @@ DEFAULT_USER_CONFIG = {
             '目标岗位：AI Agent 开发 / AI 应用开发。'
         ),
         'exclude_rules': (
-            '必须真的写代码做 AI 应用/Agent 开发，只是 JD 提到 AI、Agent、大模型不算。以下一律不投：\n'
+            '必须真的写代码做研发（AI 应用/Agent 开发，或 Java 后端 / 全栈开发），只是 JD 提到 AI、Agent、大模型不算。以下一律不投：\n'
             '1) 算法岗：模型训练/微调/预训练/SFT/RLHF/推理优化/算子/CUDA/量化、推荐/搜索/CV/NLP 算法、研究岗；\n'
             '2) 语言不匹配：C++/C#/Rust/Go/PHP/前端/客户端/Android/iOS/嵌入式/硬件/底层开发；\n'
             '3) 非研发职能：产品经理/产品助理、运营、市场、销售、商务、BD、售前、解决方案、实施交付、'
             '客户成功、客服、HR/招聘、财务、法务、设计、剪辑/短剧/配音等 AI 内容制作、数据标注、教研/讲师；\n'
-            '3b) 普通后端/全栈/业务系统开发：Java 技术栈的可以投（apply=true, role_type=ai_dev, language=java），'
-            '非 Java 的（C++/Go/Node/PHP）不投；纯前端不投；\n'
+            '3b) 后端 / 全栈：Java（或 Java + 前端）技术栈的可以投（apply=true, role_type=backend_dev, language=java）；'
+            'Python 后端的也可以（language=python）；C++/Go/Node/PHP 技术栈不投；纯前端不投；\n'
             '4) 测试、运维、SRE、DevOps、外包/驻场/派遣；\n'
             '5) 标题像开发但 JD 主体是业务、销售、交付、写文档；\n'
             '6) 信息不足时偏向不投。'
@@ -378,6 +378,27 @@ DEFAULT_USER_CONFIG = {
             'ai platform engineer': 91,
             'forward deployed': 92,
             'fde': 88,
+            # ---- Java 后端 / 全栈（与 Agent 方向并行投递） ----
+            # 注意：'java' 会命中 'javascript'，core.py 匹配前已剔除 js/ts 字样
+            'java开发': 93,
+            'java开发工程师': 95,
+            'java工程师': 91,
+            'java后端': 95,
+            'java后端开发': 96,
+            'java研发': 92,
+            'java实习': 90,
+            'java软件开发': 94,
+            'java': 88,
+            '后端开发工程师': 89,
+            '后端开发': 88,
+            '后端工程师': 88,
+            '服务端开发': 88,
+            '全栈开发': 93,
+            '全栈工程师': 92,
+            '全栈': 90,
+            'full stack': 92,
+            'fullstack': 91,
+            'full-stack': 92,
         },
         # 标题中等信号：单靠它进不了阈值，需要 JD 一起支撑
         'title_medium_keywords': {
@@ -492,6 +513,42 @@ DEFAULT_USER_CONFIG = {
             'azure': 3,
             'ci/cd': 3,
             'microservices': 3,
+        },
+        # JD 正文：后端技术栈。Java / 全栈岗的 JD 不会出现 Agent 词，
+        # 只靠 detail_support 那 12 分撑不到阈值，所以单开一桶（上限 20）
+        'detail_backend_keywords': {
+            'java': 6,
+            'spring boot': 6,
+            'springboot': 6,
+            'spring cloud': 5,
+            'springcloud': 5,
+            'mybatis': 5,
+            'mysql': 5,
+            'redis': 5,
+            'kafka': 5,
+            'rabbitmq': 4,
+            'rocketmq': 4,
+            '微服务': 6,
+            '分布式': 5,
+            '高并发': 5,
+            '消息队列': 4,
+            'jvm': 5,
+            '索引': 4,
+            '缓存': 4,
+            '事务': 3,
+            'elasticsearch': 4,
+            'mongodb': 3,
+            'nginx': 3,
+            'tomcat': 3,
+            'sql': 4,
+            'restful': 4,
+            'mvc': 3,
+            '中间件': 4,
+            '多线程': 4,
+            'linux': 3,
+            'docker': 3,
+            '接口设计': 3,
+            '服务端开发': 4,
         },
         # JD 正文负向：算法训练 / 非应用方向
         'detail_negative_keywords': {
@@ -643,6 +700,7 @@ class Config:
     title_medium_keywords = USER_CONFIG['scoring']['title_medium_keywords']
     detail_infra_keywords = USER_CONFIG['scoring']['detail_infra_keywords']
     detail_support_keywords = USER_CONFIG['scoring']['detail_support_keywords']
+    detail_backend_keywords = USER_CONFIG['scoring'].get('detail_backend_keywords', {})
     detail_negative_keywords = USER_CONFIG['scoring']['detail_negative_keywords']
 
     frontend = USER_CONFIG['frontend']

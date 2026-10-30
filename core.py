@@ -20,6 +20,14 @@ options = {
 
 LEGACY_OLLAMA_REQUIRED_MESSAGE = '当前接口依赖 ollama，但主链评分/固定招呼/直接发简历已支持在未安装 ollama 时启动运行'
 
+# 这些词只说明“是开发岗”，不说明技术栈。标题里写明 JS 技术栈时要先剔掉，
+# 否则 "Node.js后端开发" 靠 '后端开发' 就能拿到 88 分。
+_GENERIC_BACKEND_KEYWORDS = {
+    '后端开发工程师', '后端开发', '后端工程师', '服务端开发',
+    '全栈开发', '全栈工程师', '全栈',
+    'full stack', 'fullstack', 'full-stack',
+}
+
 
 def isOllamaAvailable() -> bool:
     return chat is not None and Message is not None
@@ -120,6 +128,7 @@ def evaluateJobMatch(job: str):
             'title_penalty_matches': [],
             'detail_infra_matches': [],
             'detail_support_matches': [],
+            'detail_backend_matches': [],
             'detail_negative_matches': [],
             'reason': '岗位名称命中强负向关键词',
         }
@@ -150,12 +159,22 @@ def evaluateJobMatch(job: str):
             'title_penalty_matches': [],
             'detail_infra_matches': [],
             'detail_support_matches': [],
+            'detail_backend_matches': [],
             'detail_negative_matches': [],
             'reason': f'岗位职能不是研发（命中「{title_nondev_matches[0][0]}」）',
         }
 
-    title_strong_matches = __find_matches(title, Config.title_strong_keywords)
-    title_medium_matches = __find_matches(title, Config.title_medium_keywords)
+    # "JavaScript / Node.js / TypeScript" 也是 java 开头，匹配强正向词前先剔除，
+    # 否则 "JavaScript开发工程师" 会被当成 Java 后端岗（词表里有裸 'java'）。
+    is_js_title = re.search(r'javascript|typescript|node\.?js|nodejs', title, flags=re.I)
+    match_title = re.sub(r'javascript|typescript|node\.?js|nodejs', ' ', title, flags=re.I)
+    title_strong_matches = __find_matches(match_title, Config.title_strong_keywords)
+    if is_js_title:
+        # 标题里已经写明 JS 技术栈：把“后端开发/全栈”这类泛化词也去掉，
+        # 否则 "Node.js后端开发" 会靠 '后端开发' 拿 88 分 → 一路投到 JS 岗。
+        title_strong_matches = [m for m in title_strong_matches if m[0] not in _GENERIC_BACKEND_KEYWORDS]
+    # JS 技术栈的标题连中等信号也不给（否则 "JavaScript开发" 会靠 'java' 拿 40 分）
+    title_medium_matches = [] if is_js_title else __find_matches(title, Config.title_medium_keywords)
     title_match_level = 'none'
     title_keyword = None
     title_score = 0
@@ -173,11 +192,15 @@ def evaluateJobMatch(job: str):
     title_penalty_matches = __find_matches(title, Config.title_penalty_keywords)
     detail_infra_matches = __find_matches(detail, Config.detail_infra_keywords)
     detail_support_matches = __find_matches(detail, Config.detail_support_keywords)
+    detail_backend_matches = __find_matches(detail, Config.detail_backend_keywords)
     detail_negative_matches = __find_matches(detail, Config.detail_negative_keywords)
 
     detail_infra_score = min(sum(score for _, score in detail_infra_matches), 24)
     detail_support_score = min(sum(score for _, score in detail_support_matches), 12)
-    detail_score = detail_infra_score + detail_support_score
+    # 后端技术栈单独一桶：Java/全栈岗的 JD 基本不会出现 Agent/RAG 关键词，
+    # 只靠 support 桶那 12 分撑不到阈值，必须按自己的词表给分。
+    detail_backend_score = min(sum(score for _, score in detail_backend_matches), 20)
+    detail_score = detail_infra_score + detail_support_score + detail_backend_score
     title_penalty_score = min(sum(score for _, score in title_penalty_matches), 45)
     penalty_score = min(sum(score for _, score in detail_negative_matches), 36)
 
@@ -192,6 +215,9 @@ def evaluateJobMatch(job: str):
         combo_score += 10
     if ('devops' in title_normalized or 'sre' in title_normalized) and infra_keywords.intersection({'k8s', 'kubernetes', 'docker', 'prometheus'}):
         combo_score += 10
+    # 后端岗的组合分：标题强命中 + JD 至少两个后端技术词（不叠加上面的 AI 组合分）
+    if combo_score == 0 and title_match_level == 'strong' and len(detail_backend_matches) >= 2:
+        combo_score += 10
 
     raw_score = title_score + detail_score + combo_score - title_penalty_score - penalty_score
     # 标题必须命中“目标方向词”。泛化词（web开发/python/后端…）即使 JD 里有 Agent 技术栈，
@@ -201,8 +227,8 @@ def evaluateJobMatch(job: str):
         raw_score = min(raw_score, 55)
     elif title_score < min_title_score:
         raw_score = min(raw_score, 80)
-    if not detail_infra_matches and not detail_support_matches:
-        # 标题党：标题命中 Agent 关键词，但 JD 里一点技术要求都没有（典型是市场/运营岗把 Agent 写进标题）
+    if not detail_infra_matches and not detail_support_matches and not detail_backend_matches:
+        # 标题党：标题命中方向词，但 JD 里一点技术要求都没有（典型是市场/运营岗把 AI 写进标题）
         raw_score = min(raw_score, 80)
     final_score = max(0, min(100, raw_score))
 
@@ -213,9 +239,9 @@ def evaluateJobMatch(job: str):
             reason = '岗位名称命中正向关键词，但带有弱负向词扣分'
         else:
             reason = '岗位名称命中正向关键词'
-    elif detail_infra_matches or detail_support_matches:
+    elif detail_infra_matches or detail_support_matches or detail_backend_matches:
         matched_field = 'detail'
-        keyword = (detail_infra_matches + detail_support_matches)[0][0]
+        keyword = (detail_infra_matches + detail_support_matches + detail_backend_matches)[0][0]
         reason = '仅职位描述命中，已按标题缺失封顶'
     else:
         matched_field = 'none'
@@ -240,6 +266,7 @@ def evaluateJobMatch(job: str):
         'title_penalty_matches': [keyword for keyword, _ in title_penalty_matches],
         'detail_infra_matches': [keyword for keyword, _ in detail_infra_matches],
         'detail_support_matches': [keyword for keyword, _ in detail_support_matches],
+        'detail_backend_matches': [keyword for keyword, _ in detail_backend_matches],
         'detail_negative_matches': [keyword for keyword, _ in detail_negative_matches],
         'reason': reason,
     }
