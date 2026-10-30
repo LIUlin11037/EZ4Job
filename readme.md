@@ -118,7 +118,7 @@ cp user_config.example.json user_config.json
 | `tags` | 搜索关键词列表，例如 `["AI Agent", "智能体开发"]` |
 | `introduce` | 打招呼的固定话术，**控制在 160 字内** |
 | `frontend.thread` | 投递阈值，`score >= thread` 才打招呼（默认 90） |
-| `frontend.resume.match` | 要发的那份简历的文件名关键字 |
+| `frontend.resume.profiles` | 要发的那份简历的文件名关键字（单份用 `resume.match`） |
 
 ### 3. 安装浏览器脚本
 
@@ -300,8 +300,49 @@ timestampTimeout  >  detailTimeout
 | `strict` | `true` = 匹配不到就放弃并写日志；`false` = 允许按序号兜底 |
 | `followUpText` | 发完补一句，置空则不补 |
 
+#### 多方向简历（一份 Agent、一份 Java）
+
+同时投两条线时，用 `profiles` 按方向分组。后端会根据 `role_type` 下发 `resumeKey`，
+前端按 key 取对应的关键字：
+
+```json
+"resume": {
+  "exclude": ["在线简历", "模板简历"],
+  "preferAttachment": true,
+  "strict": true,
+  "followUpText": "",
+  "defaultProfile": "agent",
+  "profiles": {
+    "agent": { "name": "Agent应用", "match": ["Agent应用", "刘林-简历-Agent"] },
+    "java":  { "name": "Java后端",  "match": ["Java后端",  "刘林-简历-Java"] }
+  }
+}
+```
+
+映射规则（`main.py::decide_resume_key`）：
+
+| 模型判定 `role_type` | 发哪份 |
+|---|---|
+| `backend_dev` | `java` |
+| `agent_dev` / `ai_dev` | `agent` |
+| `algo` / `product` / `other` | **不发**（判成这类的岗位本来也不该投） |
+| 模型没参与（未启用 / 调用失败） | 按 JD 里后端词与 Agent 词的数量比兜底 |
+| 两边都没有技术词 | **不发**，日志记 `resume_skip_unknown_role` |
+
+> **为什么判不出来就不发**：发错简历收不回来，HR 看到方向不对的简历，这个对话基本就废了；
+> 不发还能手动补。所以这里的默认行为是保守的。
+
+> **关键字必须互斥**：配了 `profiles` 之后**只**用该方向的关键字，不再混入全局 `match`。
+> 两份简历的关键字如果都只写「刘林」，`pool.find()` 会永远命中列表里第一份，等于没分方向。
+
+手动验证用油猴菜单（在聊天页打开）：
+
+- `① 检查 Agent 方向简历弹窗（不发）` / `② 检查 Java 方向简历弹窗（不发）`
+- `③ 真发 Agent 简历给当前会话` / `④ 真发 Java 简历给当前会话`
+
 **调试技巧**：看聊天页左下角的 `简历列表:` 那行日志，它会打印 Boss 弹窗里每一项的
-真实文本。`match` 里的关键字和这里对不上，就永远选中不了。
+真实文本。`match` 里的关键字和这里对不上，就永远选中不了。注意匹配是**区分大小写**的
+（`indexOf`），写 `java后端` 匹配不到 `Java后端`。
 
 ### `backend`
 
@@ -461,9 +502,12 @@ score = 标题分 + 正文分 + 组合分 - 标题扣分 - 正文扣分
 2. 只处理**有未读红点**的会话，逐条判断：
    - 最新一条是我发的 → 跳过
    - 已经发过简历（页面出现"点击预览附件简历"，或本地有记录）→ 跳过
-   - 还没发过 → 拿岗位详情 → 按 `resume` 配置选简历 → 发送 → 校验回执
+   - 还没发过 → 拿岗位详情 → 打分（同时定出 `resumeKey`）→ 按该方向选简历 → 发送 → 校验回执
 3. 发完写一条记录到 `localStorage.__zhipin_resume_sent`，30 天内不重复发给同一个人
 4. 发送失败的会话本次运行不再重试（避免反复弹窗），重启脚本可重试
+
+> 巡检是**嵌在投递循环里**的：每投一个岗位前检查一次是否到了 `chatPollIntervalMs`，
+> 到了就开聊天页扫一遍未读，扫完回投递循环继续。不是独立的定时器。
 
 **几个坑：**
 
@@ -533,7 +577,9 @@ AI Agent 开发工程师
 | 打招呼一直超时 | 回执没发出来 / 输入框没写进去 | 看 `job_actions.jsonl` 的 `greet_queue_failed` 节点 |
 | 只沟通不发招呼 | contenteditable 没触发 input 事件 | 已修（`execCommand('insertText')`），旧版本升级即可 |
 | 某关键词一直卡很久 | 该词搜不到结果，列表不存在 | 已修（空列表 3 轮提前退出），或直接换掉这个 `tags` |
-| `未找到指定简历` | `resume.match` 和弹窗文本对不上 | 看 `简历列表:` 那行，改关键字 |
+| `未找到指定简历` | `resume.match` 和弹窗文本对不上（含大小写） | 看 `简历列表:` 那行，改关键字 |
+| `未配置 xxx 方向的简历` | `profiles` 里少了这个 key | 补上 `frontend.resume.profiles.<key>` |
+| `resume_skip_unknown_role` | 模型判成 other / 没参与且无技术词 | 正常保护行为；想强制发就配 `defaultProfile` 手动发 |
 | LLM 没生效 | `enabled=false` 或没读到 Key | `curl /llm-status` 看 `describe` |
 
 ### 打分链路自测

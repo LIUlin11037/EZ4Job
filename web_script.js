@@ -49,11 +49,14 @@
         // 指定简历：优先按 resume.match 里的关键字匹配，匹配不到就不发（strict）
         resume: {
             name: '', // 想发的那份简历的名字/文件名关键字，排在最前面匹配
-            match: [], // 关键字列表，按顺序匹配
+            match: [], // 关键字列表，按顺序匹配（未配 profiles 时的兜底）
             exclude: ['在线简历', '模板简历'], // 明确不发的简历
             preferAttachment: true, // 优先切到“附件简历”页签
             strict: true, // true：匹配不到就放弃发送；false：允许发出默认选中的简历
             followUpText: '已发送，请查收', // 发完简历后补一句话，置空则不补
+            defaultProfile: 'agent', // 手动发送时用哪个方向的简历
+            // 多方向简历：后端按 role_type 下发 resumeKey，这里按 key 取对应的 match
+            profiles: {},
         },
         resumeMatch: '', // 旧字段，逗号分隔的关键字，仍兼容
     };
@@ -2050,16 +2053,28 @@
                 return rect.width > 0 && rect.height > 0;
             };
 
-            const resumeConfig = () => {
+            /**
+             * 取某个方向的简历配置。
+             * 配置形如 frontend.resume.profiles = { agent: {name, match}, java: {name, match} }
+             * 传了 profileKey 就只用该方向的关键字，不再混入全局 match，
+             * 否则 "Agent应用" 那份会被全局关键字抢先命中（两份简历会互相串）。
+             */
+            const resumeConfig = (profileKey) => {
                 const cfg = (OPTIONS.resume && typeof OPTIONS.resume === 'object') ? OPTIONS.resume : {};
+                const profiles = (cfg.profiles && typeof cfg.profiles === 'object') ? cfg.profiles : {};
+                const key = profileKey || cfg.defaultProfile || '';
+                const prof = (key && profiles[key] && typeof profiles[key] === 'object') ? profiles[key] : null;
                 const legacy = String(OPTIONS.resumeMatch || '').split(',').map(s => s.trim()).filter(Boolean);
-                const match = Array.isArray(cfg.match) ? cfg.match.slice() : [];
-                const keywords = [cfg.name, ...match, ...legacy]
+                const sourceMatch = prof ? prof.match : cfg.match;
+                const match = Array.isArray(sourceMatch) ? sourceMatch.slice() : [];
+                const keywords = [prof ? prof.name : cfg.name, ...match, ...(prof ? [] : legacy)]
                     .filter(Boolean)
                     .map(s => String(s).trim())
                     .filter(Boolean);
                 return {
-                    name: cfg.name || '',
+                    profileKey: key,
+                    hasProfile: !!prof,
+                    name: (prof && prof.name) || cfg.name || '',
                     keywords: Array.from(new Set(keywords)),
                     exclude: Array.isArray(cfg.exclude) && cfg.exclude.length ? cfg.exclude : ['在线简历', '模板简历'],
                     preferAttachment: cfg.preferAttachment !== false,
@@ -2264,7 +2279,12 @@
                 const dryRun = !!options.dryRun;
                 // 详情页会抢焦点，聊天页可能在后台；弹窗在后台标签里可能量出 0 尺寸
                 try { window.focus(); } catch (e) { /* 被浏览器忽略也没关系 */ }
-                const cfg = resumeConfig();
+                const cfg = resumeConfig(options.profileKey);
+                if (options.profileKey && !cfg.hasProfile) {
+                    const reason = `未配置 ${options.profileKey} 方向的简历（frontend.resume.profiles.${options.profileKey}）`;
+                    logger.add(reason + '，本次不发送');
+                    return { sent: false, reason, mode: 'no_profile' };
+                }
                 const sendBtn = await waitResumeSendBtn();
                 if (!sendBtn) {
                     const snap = describeResumeUi();
@@ -2586,14 +2606,29 @@
                                 // 详情页会自己 window.close()，稍等让焦点回到聊天页再操作简历弹窗
                                 await tools.asyncSleep(600);
                                 const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
-                                status(`检测到新消息，正在发送指定简历`);
-                                const resumeResult = await sendResume(decision.resumeIndex);
+                                // 后端按 role_type 给出该发哪份：agent / java。判不出来就不发，
+                                // 免得把 Agent 简历投给 Java 岗（发出去收不回来）。
+                                const resumeKey = decision && decision.resumeKey ? String(decision.resumeKey) : '';
+                                if (!resumeKey) {
+                                    status('未能判定岗位方向（Agent / Java），本次不自动发简历，请手动发送');
+                                    await logAction({
+                                        action: 'resume_skip_unknown_role',
+                                        scene: 'chat',
+                                        title: jobInfo.title,
+                                        salary: jobInfo.salary,
+                                        score: decision ? decision.score : null,
+                                    });
+                                    continue;
+                                }
+                                status(`检测到新消息（判定为 ${resumeKey} 方向），正在发送对应简历`);
+                                const resumeResult = await sendResume(decision.resumeIndex, { profileKey: resumeKey });
                                 if (!resumeResult.sent) failedResumeContacts.add(contactKey);
                                 await logAction({
                                     action: resumeResult.sent ? 'resume_sent' : 'resume_skip',
                                     scene: 'chat',
                                     title: jobInfo.title,
                                     salary: jobInfo.salary,
+                                    resumeProfile: resumeKey,
                                     requestedResumeIndex: decision.resumeIndex,
                                     selectedResumeIndex: resumeResult?.selectedResumeIndex ?? null,
                                     selectedResumeName: resumeResult?.selectedResumeName || null,
@@ -2640,29 +2675,32 @@
                 await once();
             };
 
-            // 手动测试入口：在 Boss 聊天页点油猴图标，菜单里选“测试发送指定简历”
+            // 手动测试入口：在 Boss 聊天页点油猴图标，菜单里选对应方向
             if (typeof GM_registerMenuCommand === 'function') {
-                // 试运行：只打开弹窗看有哪些简历、会选中哪个，不点确认，不会真发
-                GM_registerMenuCommand('① 检查简历弹窗（不发）', async () => {
-                    // sendResume 内部会写 logger，这里必须先确保它存在
+                const dryRunWith = async (profileKey) => {
                     if (!logger) logger = new Logger();
-                    logger.add('=== 试运行：检查简历弹窗 ===');
+                    logger.add(`=== 试运行：检查 [${profileKey}] 方向简历弹窗 ===`);
                     await reloadConfig();
-                    const result = await sendResume(OPTIONS.resumeIndex, { dryRun: true });
+                    const result = await sendResume(OPTIONS.resumeIndex, { dryRun: true, profileKey });
                     logger.add(result.dryRun
                         ? `✅ 链路正常，本应发送：${result.selectedResumeName}（${result.matchedBy}）`
                         : `⚠️ 链路有问题：${result.reason}`);
-                });
-                // 真实发送：会真的把简历发给当前会话
-                GM_registerMenuCommand('② 真的给当前会话发简历', async () => {
+                };
+                const sendWith = async (profileKey) => {
                     if (!logger) logger = new Logger();
-                    logger.add('=== 真实发送简历 ===');
+                    logger.add(`=== 真实发送 [${profileKey}] 方向简历 ===`);
                     await reloadConfig();
-                    const result = await sendResume();
+                    const result = await sendResume(OPTIONS.resumeIndex, { profileKey });
                     logger.add(result.sent
                         ? `✅ 已发送：${result.selectedResumeName || '(未识别名称)'}（${result.confirmed || result.mode}）`
                         : `❌ 未发送：${result.reason}`);
-                });
+                };
+                // 试运行：只打开弹窗看有哪些简历、会选中哪个，不点确认，不会真发
+                GM_registerMenuCommand('① 检查 Agent 方向简历弹窗（不发）', () => dryRunWith('agent'));
+                GM_registerMenuCommand('② 检查 Java 方向简历弹窗（不发）', () => dryRunWith('java'));
+                // 真实发送：会给当前打开的会话发出去，无法撤回
+                GM_registerMenuCommand('③ 真发 Agent 简历给当前会话', () => sendWith('agent'));
+                GM_registerMenuCommand('④ 真发 Java 简历给当前会话', () => sendWith('java'));
             }
 
             // 主函数

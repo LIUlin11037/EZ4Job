@@ -10,6 +10,29 @@ from config import Config
 import llm_judge
 
 
+def decide_resume_key(result: dict) -> str:
+    """决定这个岗位该发哪份简历。
+
+    backend_dev → 'java'，agent_dev / ai_dev → 'agent'。
+    模型没参与（未启用 / 调用失败 / 被否决）时，退一步按正文命中数量判断；
+    两边都没有技术词就返回空串，前端会放弃发送（发错简历收不回来，宁可不发）。
+    """
+    role = result.get('llm_role')
+    if role:
+        if role == 'backend_dev':
+            return 'java'
+        if role in ('agent_dev', 'ai_dev'):
+            return 'agent'
+        # 模型明确判成 algo / product / other 等 → 两份都不该发
+        return ''
+    # 模型没参与（未启用或调用失败）：按正文命中数量兜底
+    backend_hits = len(result.get('detail_backend_matches') or [])
+    ai_hits = len(result.get('detail_infra_matches') or [])
+    if backend_hits or ai_hits:
+        return 'java' if backend_hits > ai_hits else 'agent'
+    return ''
+
+
 app = FastAPI()
 LOG_PATH = Path(__file__).resolve().parent / 'job_decisions.jsonl'
 ACTION_LOG_PATH = Path(__file__).resolve().parent / 'job_actions.jsonl'
@@ -39,6 +62,7 @@ def append_job_decision_log(result: dict, raw_job: str, delay_ms: int):
         'titlePenaltyScore': result.get('title_penalty_score'),
         'penaltyScore': result.get('penalty_score'),
         'reason': result.get('reason'),
+        'resumeKey': result.get('resume_key'),
         'delayMs': delay_ms,
         'rawJob': raw_job,
     }
@@ -87,6 +111,8 @@ async def get_job_score(job: str = Body(..., description="职位信息")):
         )
         result = llm_judge.apply_verdict(result, verdict, thread)
 
+    result['resume_key'] = decide_resume_key(result)
+
     delay_ms = max(0, Config.job_score_delay_base_ms + random.randint(
         -Config.job_score_delay_jitter_ms,
         Config.job_score_delay_jitter_ms,
@@ -125,6 +151,7 @@ async def get_job_score(job: str = Body(..., description="职位信息")):
         f"penalty_score={result['penalty_score']} | "
         f"delay_ms={delay_ms} | "
         f"score={result['score']}{rule_part} | "
+        f"resume={result['resume_key'] or '-'} | "
         f"reason={result['reason']}"
         f"{llm_part}",
         flush=True
@@ -135,6 +162,7 @@ async def get_job_score(job: str = Body(..., description="职位信息")):
         'score': result['score'],
         'introduce': result['introduce'],
         'resumeIndex': result['resumeIndex'],
+        'resumeKey': result['resume_key'],
     }
 
 

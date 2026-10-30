@@ -97,6 +97,10 @@ DEFAULT_USER_CONFIG = {
             'preferAttachment': True,
             'strict': True,
             'followUpText': '已发送，请查收',
+            # 多方向简历：后端按 role_type 下发 resumeKey（agent / java），前端取这里对应的 match。
+            # 配了 profiles 就只按方向取关键字，不再混用上面的全局 match。
+            'defaultProfile': 'agent',
+            'profiles': {},
         },
     },
     'scoring': {
