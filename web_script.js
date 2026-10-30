@@ -1205,31 +1205,62 @@
             };
 
             // 添加到聊天列表
-            const addToChatList = async (url) => {
-                return new Promise((resolve, reject) => {
-                    fetch(url)
+            // Boss 在沟通量接近上限时会回一个「温馨提示」：
+            //   "您今天已与120位BOSS沟通，还剩30次沟通机会哦"
+            // 这不是拒绝，只是要你确认一次；当成失败累加的话，连续 5 次就会把整个程序停掉。
+            const parseGreetRemind = (text) => {
+                const t = String(text || '');
+                if (!/温馨提示|沟通机会|还剩\s*\d+\s*次|剩余\s*\d+\s*次/.test(t)) return null;
+                const left = t.match(/(?:还剩|剩余)\s*(\d+)\s*次/);
+                // 同一句话里还带着 Boss 自己数的“已与 N 位沟通”，比本地计数可靠（能算上手动打的）
+                const used = t.match(/已与\s*(\d+)\s*位/);
+                return {
+                    remaining: left ? Number(left[1]) : null,
+                    used: used ? Number(used[1]) : null,
+                };
+            };
+
+            const addToChatList = (url) => {
+                const readOnce = () => new Promise((resolve, reject) => {
+                    // fetch 本身没有超时，网关卡住时会永远不 resolve，整个投递循环就停在那里
+                    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+                    const timer = setTimeout(() => {
+                        try { if (ctrl) ctrl.abort(); } catch (e) { /* 忽略 */ }
+                        reject(new Error('timeout:打招呼请求 20s 未返回'));
+                    }, 20000);
+                    fetch(url, ctrl ? { signal: ctrl.signal } : undefined)
                         .then(async resp => {
                             if (!(resp.ok && resp.status === 200)) {
                                 const bodyText = await resp.text().catch(() => '');
+                                clearTimeout(timer);
                                 logger.add(`boss直聘网络连接出错: status=${resp.status}`);
                                 return reject(new Error(`http_${resp.status}:${bodyText.slice(0, 300)}`));
                             }
                             return resp.json();
                         }).then(resp => {
+                            clearTimeout(timer);
                             if (resp.code === 0) return resolve(resp);
                             const biz = resp?.zpData?.bizData || {};
                             const dialog = biz.chatRemindDialog || {};
                             const title = dialog.title || '';
                             const body = dialog.content || dialog.text || dialog.message
                                 || dialog.desc || dialog.subTitle || dialog.tips || '';
-                            const snippet = JSON.stringify(dialog || biz || resp).slice(0, 260);
+                            const snippet = JSON.stringify(dialog || biz || resp).slice(0, 400);
                             const msg = [title, body].filter(Boolean).join(' / ') || resp?.message || '未知错误';
-                            logger.add(`打招呼失败: ${msg}`);
-                            logger.add(`平台原文: ${snippet}`);
                             reject(new Error(`biz_fail:${msg} || ${snippet}`));
                         }).catch(err => {
+                            clearTimeout(timer);
                             reject(err instanceof Error ? err : new Error(String(err)));
                         });
+                });
+
+                return readOnce().catch(async (err) => {
+                    if (!parseGreetRemind(String((err && err.message) || err))) throw err;
+                    // 确认类提示：等一会儿再发一次，很多时候第二次就放行了
+                    const left = parseGreetRemind(String((err && err.message) || err)).remaining;
+                    logger.add(`Boss 提示${left !== null ? `还剩 ${left} 次沟通机会` : '需要确认沟通额度'}，1.5 秒后重试一次`);
+                    await tools.asyncSleep(1500);
+                    return readOnce();
                 });
             };
 
@@ -1452,7 +1483,39 @@
                             });
                             clearPendingGreet();
                             const reasonText = String(err);
-                            const limitHit = /上限|次数|限制|频繁|稍后再试/.test(reasonText);
+                            // 先认「温馨提示（还剩 N 次）」：这是确认提示，不是拒绝。
+                            // 原来这里判不出来，会一路累加 streak 直到 stopProgram，白白停掉还剩的额度。
+                            const remind = parseGreetRemind(reasonText);
+                            if (remind) {
+                                greetFailStreak = 0;
+                                // 用 Boss 自己数的“已与 N 位沟通”校正本地计数：它算得上手动打招呼，本地算不到
+                                if (remind.used !== null && remind.used > dailyGreetCount) {
+                                    dailyGreetCount = remind.used;
+                                    logger.add(`按 Boss 返回校正今日已沟通数：${dailyGreetCount} 个（本地计数偏少，可能含手动打招呼）`);
+                                }
+                                const left = remind.remaining !== null ? `还剩 ${remind.remaining} 次` : '需要确认额度';
+                                await logAction({
+                                    action: 'greet_remind_confirm',
+                                    scene: 'search',
+                                    title: jobInfo.title,
+                                    remaining: remind.remaining,
+                                    bossUsed: remind.used,
+                                    reason: reasonText.slice(0, 160),
+                                });
+                                const dailyLimit = Number(OPTIONS.maxGreetsPerDay) || 0;
+                                if (dailyLimit > 0 && dailyGreetCount >= dailyLimit) {
+                                    stopProgram(`按 Boss 计数今日已沟通 ${dailyGreetCount} 个，达到 maxGreetsPerDay=${dailyLimit}`);
+                                    return;
+                                }
+                                logger.add(`Boss 提示今日沟通较多（${left}），重试后仍未放行`);
+                                stopProgram(
+                                    `Boss 要求确认沟通额度（${left}）。` +
+                                    '这不是拒绝——请在 Boss 页面手动点一次「立即沟通」，在弹窗里点「继续沟通」，' +
+                                    '然后点面板上的「继续」接着跑'
+                                );
+                                return;
+                            }
+                            const limitHit = /上限|次数|限制|频繁|稍后再试|已达/.test(reasonText);
                             if (limitHit) {
                                 stopProgram(`平台提示触到限额/风控：${reasonText.slice(0, 120)}`);
                                 return;
